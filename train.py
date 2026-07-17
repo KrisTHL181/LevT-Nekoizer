@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Single-machine training entry point for the Levenshtein Transformer."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import math
+import random
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
+
+import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+
+from levt.checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, save_checkpoint
+from levt.config import LevTConfig, TrainConfig
+from levt.data import JsonlDataset, LevTCollator
+from levt.embeddings import import_hf_embeddings
+from levt.model import LevTModel
+from levt.trainer import DualPolicyTrainer
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-config", default="config.json")
+    parser.add_argument("--train-config", default="train_config.json")
+    parser.add_argument("--resume", default=None, help="checkpoint path; overrides train_config")
+    return parser.parse_args()
+
+
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable")
+    return device
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_loader(
+    path: str,
+    model_cfg: LevTConfig,
+    train_cfg: TrainConfig,
+    *,
+    shuffle: bool,
+    shuffle_seed: Optional[int] = None,
+) -> DataLoader:
+    dataset = JsonlDataset(
+        path, model_cfg,
+        max_source_length=train_cfg.max_source_length,
+        max_target_length=train_cfg.max_target_length,
+    )
+    collator = LevTCollator(
+        model_cfg,
+        max_source_length=train_cfg.max_source_length,
+        max_target_length=train_cfg.max_target_length,
+    )
+    generator = None
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(train_cfg.seed if shuffle_seed is None else shuffle_seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=shuffle,
+        generator=generator,
+        num_workers=train_cfg.num_workers,
+        collate_fn=collator,
+    )
+    if len(loader) == 0:
+        raise ValueError(f"data loader for {path} has zero batches")
+    return loader
+
+
+def scheduler_factor(step: int, warmup: int, total: int) -> float:
+    if warmup and step < warmup:
+        return float(step + 1) / float(warmup)
+    remaining = max(0, total - step)
+    decay_steps = max(1, total - warmup)
+    return float(remaining) / float(decay_steps)
+
+
+def autocast_context(device: torch.device, amp_dtype: str):
+    if amp_dtype == "none":
+        return contextlib.nullcontext()
+    if device.type != "cuda":
+        if amp_dtype == "float16":
+            raise ValueError("float16 AMP is only supported on CUDA")
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+    dtype = torch.float16 if amp_dtype == "float16" else torch.bfloat16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def make_scaler(device: torch.device, amp_dtype: str):
+    enabled = device.type == "cuda" and amp_dtype == "float16"
+    return torch.amp.GradScaler("cuda", enabled=enabled)
+
+
+def checkpoint_payload(
+    model: LevTModel,
+    optimizer: AdamW,
+    scheduler: LambdaLR,
+    scaler: Any,
+    model_cfg: LevTConfig,
+    train_cfg: TrainConfig,
+    *,
+    global_step: int,
+    epoch: int,
+    next_batch_index: int,
+) -> Dict[str, Any]:
+    return {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "model_config": model_cfg.to_dict(),
+        "train_config": train_cfg.to_dict(),
+        "global_step": global_step,
+        "epoch": epoch,
+        "next_batch_index": next_batch_index,
+        "rng_state": capture_rng_state(),
+    }
+
+
+def write_checkpoints(directory: Path, step: int, payload: Dict[str, Any]) -> None:
+    save_checkpoint(directory / f"step_{step:08d}.pt", payload)
+    save_checkpoint(directory / "latest.pt", payload)
+
+
+def evaluate(
+    model: LevTModel,
+    trainer: DualPolicyTrainer,
+    loader: DataLoader,
+    device: torch.device,
+    amp_dtype: str,
+) -> float:
+    was_training = model.training
+    model.eval()
+    totals = {"plh": 0.0, "tok": 0.0, "del": 0.0}
+    counts = {"plh": 0, "tok": 0, "del": 0}
+    rng_state = capture_rng_state()
+    seed_everything(0)
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                prepared = trainer.prepare_batch(batch)
+                with autocast_context(device, amp_dtype):
+                    sums, batch_counts = trainer.loss_sums_and_counts(prepared)
+                for name in totals:
+                    totals[name] += float(sums[name])
+                    counts[name] += batch_counts[name]
+    finally:
+        restore_rng_state(rng_state)
+        model.train(was_training)
+    if not any(counts.values()):
+        raise ValueError("validation loader has no valid labels")
+    return sum(totals[name] / counts[name] for name in totals if counts[name])
+
+
+def main() -> None:
+    args = parse_args()
+    model_cfg = LevTConfig.from_json(args.model_config)
+    train_cfg = TrainConfig.from_json(args.train_config)
+    device = resolve_device(train_cfg.device)
+    seed_everything(train_cfg.seed)
+
+    validation_loader = (
+        make_loader(train_cfg.validation_data, model_cfg, train_cfg, shuffle=False)
+        if train_cfg.validation_data else None
+    )
+
+    model = LevTModel(model_cfg)
+    resume_path = args.resume or train_cfg.resume_from
+    checkpoint: Optional[Dict[str, Any]] = None
+    if resume_path:
+        checkpoint = load_checkpoint(resume_path, map_location="cpu")
+        if checkpoint["model_config"] != model_cfg.to_dict():
+            raise ValueError("checkpoint model configuration does not match config.json")
+        saved_train_config = checkpoint.get("train_config")
+        current_train_config = train_cfg.to_dict()
+        if isinstance(saved_train_config, dict):
+            saved_train_config = {**saved_train_config, "resume_from": None}
+            current_train_config = {**current_train_config, "resume_from": None}
+        if saved_train_config != current_train_config:
+            raise ValueError("checkpoint training configuration does not match train_config.json")
+        model.load_state_dict(checkpoint["model"])
+    else:
+        import_hf_embeddings(
+            model,
+            train_cfg.hf_model_name_or_path,
+            local_files_only=train_cfg.local_files_only,
+            trust_remote_code=train_cfg.trust_remote_code,
+            dtype=train_cfg.hf_dtype,
+        )
+    model.to(device)
+    model.shared_embedding.weight.requires_grad_(not train_cfg.freeze_embeddings)
+
+    trainer = DualPolicyTrainer(model, model_cfg, train_cfg.policy)
+    optimizer = AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=train_cfg.learning_rate,
+        weight_decay=train_cfg.weight_decay,
+        betas=train_cfg.betas,
+        eps=train_cfg.eps,
+    )
+    scheduler = LambdaLR(
+        optimizer,
+        lambda step: scheduler_factor(step, train_cfg.warmup_steps, train_cfg.max_training_steps),
+    )
+    scaler = make_scaler(device, train_cfg.amp_dtype)
+    global_step = 0
+    start_epoch = 0
+    next_batch_index = 0
+    if checkpoint is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        scaler.load_state_dict(checkpoint.get("scaler", {}))
+        global_step = int(checkpoint["global_step"])
+        start_epoch = int(checkpoint["epoch"])
+        next_batch_index = int(checkpoint.get("next_batch_index", 0))
+        restore_rng_state(checkpoint["rng_state"])
+
+    checkpoint_dir = Path(train_cfg.checkpoint_dir)
+    optimizer.zero_grad(set_to_none=True)
+    resume_batch_index = next_batch_index
+    final_epoch = start_epoch
+    final_batch_index = resume_batch_index
+    for epoch in range(start_epoch, train_cfg.epochs):
+        train_loader = make_loader(
+            train_cfg.train_data,
+            model_cfg,
+            train_cfg,
+            shuffle=True,
+            shuffle_seed=train_cfg.seed + epoch,
+        )
+        if resume_batch_index > len(train_loader):
+            raise ValueError("checkpoint batch position exceeds the epoch length")
+        train_iterator = iter(enumerate(train_loader))
+        for batch_index, batch in train_iterator:
+            if global_step >= train_cfg.max_training_steps:
+                break
+            if batch_index < resume_batch_index:
+                continue
+            window = [(batch_index, trainer.prepare_batch(batch))]
+            for _ in range(1, train_cfg.gradient_accumulation_steps):
+                try:
+                    next_index_in_window, next_batch = next(train_iterator)
+                except StopIteration:
+                    break
+                window.append((next_index_in_window, trainer.prepare_batch(next_batch)))
+            window_counts = {
+                name: sum(prepared.counts[name] for _, prepared in window)
+                for name in ("plh", "tok", "del")
+            }
+            metric_sums = {"plh": 0.0, "tok": 0.0, "del": 0.0}
+            for _, prepared in window:
+                with autocast_context(device, train_cfg.amp_dtype):
+                    sums, _ = trainer.loss_sums_and_counts(prepared)
+                    loss = sum(
+                        sums[name] / window_counts[name]
+                        if window_counts[name] else sums[name] * 0.0
+                        for name in sums
+                    )
+                scaler.scale(loss).backward()
+                for name in metric_sums:
+                    metric_sums[name] += float(sums[name].detach())
+            metrics = {
+                "loss_ins_plh": metric_sums["plh"] / window_counts["plh"] if window_counts["plh"] else 0.0,
+                "loss_ins_tok": metric_sums["tok"] / window_counts["tok"] if window_counts["tok"] else 0.0,
+                "loss_del": metric_sums["del"] / window_counts["del"] if window_counts["del"] else 0.0,
+            }
+            metrics["loss_total"] = sum(metrics.values())
+            last_batch_index = window[-1][0]
+            scaler.unscale_(optimizer)
+            if train_cfg.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            global_step += 1
+
+            next_epoch = epoch
+            next_index = last_batch_index + 1
+            if next_index == len(train_loader):
+                next_epoch = epoch + 1
+                next_index = 0
+            final_epoch = next_epoch
+            final_batch_index = next_index
+
+            if global_step % train_cfg.log_every_steps == 0:
+                print(
+                    f"step={global_step} epoch={epoch} "
+                    f"loss={metrics['loss_total']:.6f} lr={scheduler.get_last_lr()[0]:.8g}",
+                    flush=True,
+                )
+            if validation_loader is not None and global_step % train_cfg.validate_every_steps == 0:
+                val_loss = evaluate(model, trainer, validation_loader, device, train_cfg.amp_dtype)
+                print(f"step={global_step} validation_loss={val_loss:.6f}", flush=True)
+            if global_step % train_cfg.checkpoint_every_steps == 0:
+                write_checkpoints(
+                    checkpoint_dir, global_step,
+                    checkpoint_payload(
+                        model, optimizer, scheduler, scaler, model_cfg, train_cfg,
+                        global_step=global_step,
+                        epoch=next_epoch,
+                        next_batch_index=next_index,
+                    ),
+                )
+            if global_step >= train_cfg.max_training_steps:
+                break
+        resume_batch_index = 0
+        if global_step >= train_cfg.max_training_steps:
+            break
+
+    payload = checkpoint_payload(
+        model, optimizer, scheduler, scaler, model_cfg, train_cfg,
+        global_step=global_step,
+        epoch=final_epoch,
+        next_batch_index=final_batch_index,
+    )
+    write_checkpoints(checkpoint_dir, global_step, payload)
+    print(f"training complete: step={global_step}, checkpoint={checkpoint_dir / 'latest.pt'}")
+
+
+if __name__ == "__main__":
+    main()
