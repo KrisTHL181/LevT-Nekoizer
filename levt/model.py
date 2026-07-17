@@ -325,7 +325,7 @@ class FFNBlock(nn.Module):
             # Standard FFN: down(act(up(x)))
             self.linear1 = nn.Linear(d_model, d_ff)
             self.linear2 = nn.Linear(d_ff, d_model)
-            self.act = nn.ReLU() if activation == "relu" else nn.GELU()
+            self.act = nn.ReLU() if activation == "relu" else nn.GELU(approximate="tanh")
             self.gate_proj = None
             self.up_proj = None
             self.down_proj = None
