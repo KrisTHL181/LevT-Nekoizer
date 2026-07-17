@@ -239,6 +239,11 @@ class TrainConfig:
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
+    muon_lr: float = 0.02
+    muon_weight_decay: float = 0.01
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
     warmup_steps: int = 10000
     max_training_steps: int = 300000
     epochs: int = 1
@@ -291,6 +296,17 @@ class TrainConfig:
             raise ValueError("amp_dtype must be none, float16, or bfloat16")
         if self.max_grad_norm < 0:
             raise ValueError("max_grad_norm must be non-negative")
+        for name in ("muon_lr", "muon_weight_decay", "muon_momentum"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be finite numeric")
+        if self.muon_lr <= 0 or self.muon_weight_decay < 0 or self.muon_momentum < 0:
+            raise ValueError("Muon values must be positive (weight_decay/momentum may be zero)")
+        if not 0 <= self.muon_momentum < 1:
+            raise ValueError("muon_momentum must be in [0, 1)")
+        if not isinstance(self.muon_nesterov, bool):
+            raise ValueError("muon_nesterov must be a boolean")
+        _positive_int("muon_ns_steps", self.muon_ns_steps)
 
     @property
     def policy(self) -> PolicyConfig:

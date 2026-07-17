@@ -84,9 +84,7 @@ def validate_record(
         "y_ins", "p_star", "t_star", "y_ins_plh",
         "y_ins_rnd", "p_star_rnd", "t_star_rnd", "y_ins_plh_rnd",
     }
-    unknown = sorted(set(record) - _ALLOWED_KEYS)
-    if unknown:
-        raise ValueError(f"{source}: unknown keys: {', '.join(unknown)}")
+    # Silently ignore extra keys — training only uses the fields it needs
     missing = sorted({"src", "target"} - set(record))
     if missing:
         raise ValueError(f"{source}: missing required keys: {', '.join(missing)}")

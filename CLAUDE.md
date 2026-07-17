@@ -112,13 +112,25 @@ This is single-machine, single-GPU or CPU training. CUDA FP16 alone uses
 GradScaler; BF16 uses autocast without scaling. It supports accumulation,
 clipping, validation, warmup plus linear decay, and periodic logging.
 
+**Optimizers**: `nn.Linear.weight` parameters use Muon; all other parameters
+(biases, RMSNorm weights, embedding weights) use AdamW. `build_optimizers()`
+routes parameters by collecting `id(module.weight)` for every `nn.Linear`
+submodule. Both optimizers share the same warmup+linear-decay LR schedule but
+with independently configurable base learning rates (`learning_rate` for AdamW,
+`muon_lr` for Muon). `TrainConfig` holds separate hyperparameters for each:
+AdamW uses `learning_rate`, `weight_decay`, `betas`, `eps`; Muon uses
+`muon_lr`, `muon_weight_decay`, `muon_momentum`, `muon_nesterov`,
+`muon_ns_steps`.
+
+Checkpoints store both optimizer/scheduler state dicts under nested
+`"optimizer"` and `"scheduler"` keys (`"adamw"` / `"muon"` sub-keys).
 Checkpoints are atomic and versioned. `latest.pt` and numbered step files hold
-model, optimizer, scheduler, scaler, step, epoch plus next-batch resume cursor,
-both configs, and Python, Torch, and CUDA RNG state where available. Training
-shuffle order is deterministic per epoch, so an optimizer-boundary checkpoint
-resumes without replaying prior batches. Resume verifies exact model config
-before restoring state. Validation uses a fixed temporary RNG state and restores
-the training RNG afterward.
+model, optimizers, schedulers, scaler, step, epoch plus next-batch resume
+cursor, both configs, and Python, Torch, and CUDA RNG state where available.
+Training shuffle order is deterministic per epoch, so an optimizer-boundary
+checkpoint resumes without replaying prior batches. Resume verifies exact model
+config before restoring state. Validation uses a fixed temporary RNG state and
+restores the training RNG afterward.
 
 ## Expert and inference
 

@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 import torch
-from torch.optim import AdamW
+import torch.nn as nn
+from torch.optim import AdamW, Muon
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
@@ -106,10 +107,64 @@ def make_scaler(device: torch.device, amp_dtype: str):
     return torch.amp.GradScaler("cuda", enabled=enabled)
 
 
+def _linear_weight_ids(model: nn.Module) -> set[int]:
+    """Collect parameter ids of every ``nn.Linear.weight`` in the model.
+
+    These are the 2-D matrix parameters that Muon will optimize; everything
+    else (biases, norms, embeddings) stays with AdamW.
+    """
+    ids: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            ids.add(id(module.weight))
+    return ids
+
+
+def build_optimizers(
+    model: nn.Module,
+    train_cfg: TrainConfig,
+) -> tuple[AdamW, Muon]:
+    """Return ``(adamw, muon)`` with parameters routed by type."""
+    linear_ids = _linear_weight_ids(model)
+    muon_params: list[nn.Parameter] = []
+    adamw_params: list[nn.Parameter] = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in linear_ids:
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
+
+    if not muon_params:
+        raise ValueError("no Linear.weight parameters found for Muon optimizer")
+    if not adamw_params:
+        raise ValueError("no non-Linear parameters found for AdamW optimizer")
+
+    adamw = AdamW(
+        adamw_params,
+        lr=train_cfg.learning_rate,
+        weight_decay=train_cfg.weight_decay,
+        betas=train_cfg.betas,
+        eps=train_cfg.eps,
+    )
+    muon = Muon(
+        muon_params,
+        lr=train_cfg.muon_lr,
+        weight_decay=train_cfg.muon_weight_decay,
+        momentum=train_cfg.muon_momentum,
+        nesterov=train_cfg.muon_nesterov,
+        ns_steps=train_cfg.muon_ns_steps,
+    )
+    return adamw, muon
+
+
 def checkpoint_payload(
     model: LevTModel,
-    optimizer: AdamW,
-    scheduler: LambdaLR,
+    adamw: AdamW,
+    muon: Muon,
+    adamw_scheduler: LambdaLR,
+    muon_scheduler: LambdaLR,
     scaler: Any,
     model_cfg: LevTConfig,
     train_cfg: TrainConfig,
@@ -120,8 +175,14 @@ def checkpoint_payload(
 ) -> Dict[str, Any]:
     return {
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
+        "optimizer": {
+            "adamw": adamw.state_dict(),
+            "muon": muon.state_dict(),
+        },
+        "scheduler": {
+            "adamw": adamw_scheduler.state_dict(),
+            "muon": muon_scheduler.state_dict(),
+        },
         "scaler": scaler.state_dict(),
         "model_config": model_cfg.to_dict(),
         "train_config": train_cfg.to_dict(),
@@ -206,15 +267,13 @@ def main() -> None:
     model.shared_embedding.weight.requires_grad_(not train_cfg.freeze_embeddings)
 
     trainer = DualPolicyTrainer(model, model_cfg, train_cfg.policy)
-    optimizer = AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=train_cfg.learning_rate,
-        weight_decay=train_cfg.weight_decay,
-        betas=train_cfg.betas,
-        eps=train_cfg.eps,
+    adamw, muon = build_optimizers(model, train_cfg)
+    adamw_scheduler = LambdaLR(
+        adamw,
+        lambda step: scheduler_factor(step, train_cfg.warmup_steps, train_cfg.max_training_steps),
     )
-    scheduler = LambdaLR(
-        optimizer,
+    muon_scheduler = LambdaLR(
+        muon,
         lambda step: scheduler_factor(step, train_cfg.warmup_steps, train_cfg.max_training_steps),
     )
     scaler = make_scaler(device, train_cfg.amp_dtype)
@@ -222,8 +281,10 @@ def main() -> None:
     start_epoch = 0
     next_batch_index = 0
     if checkpoint is not None:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
+        adamw.load_state_dict(checkpoint["optimizer"]["adamw"])
+        muon.load_state_dict(checkpoint["optimizer"]["muon"])
+        adamw_scheduler.load_state_dict(checkpoint["scheduler"]["adamw"])
+        muon_scheduler.load_state_dict(checkpoint["scheduler"]["muon"])
         scaler.load_state_dict(checkpoint.get("scaler", {}))
         global_step = int(checkpoint["global_step"])
         start_epoch = int(checkpoint["epoch"])
@@ -231,7 +292,8 @@ def main() -> None:
         restore_rng_state(checkpoint["rng_state"])
 
     checkpoint_dir = Path(train_cfg.checkpoint_dir)
-    optimizer.zero_grad(set_to_none=True)
+    adamw.zero_grad(set_to_none=True)
+    muon.zero_grad(set_to_none=True)
     resume_batch_index = next_batch_index
     final_epoch = start_epoch
     final_batch_index = resume_batch_index
@@ -281,13 +343,17 @@ def main() -> None:
             }
             metrics["loss_total"] = sum(metrics.values())
             last_batch_index = window[-1][0]
-            scaler.unscale_(optimizer)
+            scaler.unscale_(adamw)
+            scaler.unscale_(muon)
             if train_cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
-            scaler.step(optimizer)
+            scaler.step(adamw)
+            scaler.step(muon)
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            adamw.zero_grad(set_to_none=True)
+            muon.zero_grad(set_to_none=True)
+            adamw_scheduler.step()
+            muon_scheduler.step()
             global_step += 1
 
             next_epoch = epoch
@@ -301,7 +367,7 @@ def main() -> None:
             if global_step % train_cfg.log_every_steps == 0:
                 print(
                     f"step={global_step} epoch={epoch} "
-                    f"loss={metrics['loss_total']:.6f} lr={scheduler.get_last_lr()[0]:.8g}",
+                    f"loss={metrics['loss_total']:.6f} lr_adamw={adamw_scheduler.get_last_lr()[0]:.8g} lr_muon={muon_scheduler.get_last_lr()[0]:.8g}",
                     flush=True,
                 )
             if validation_loader is not None and global_step % train_cfg.validate_every_steps == 0:
@@ -311,7 +377,8 @@ def main() -> None:
                 write_checkpoints(
                     checkpoint_dir, global_step,
                     checkpoint_payload(
-                        model, optimizer, scheduler, scaler, model_cfg, train_cfg,
+                        model, adamw, muon, adamw_scheduler, muon_scheduler,
+                        scaler, model_cfg, train_cfg,
                         global_step=global_step,
                         epoch=next_epoch,
                         next_batch_index=next_index,
@@ -324,7 +391,8 @@ def main() -> None:
             break
 
     payload = checkpoint_payload(
-        model, optimizer, scheduler, scaler, model_cfg, train_cfg,
+        model, adamw, muon, adamw_scheduler, muon_scheduler,
+        scaler, model_cfg, train_cfg,
         global_step=global_step,
         epoch=final_epoch,
         next_batch_index=final_batch_index,
