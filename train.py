@@ -21,6 +21,7 @@ from levt.config import LevTConfig, TrainConfig
 from levt.data import JsonlDataset, LevTCollator
 from levt.embeddings import import_hf_embeddings
 from levt.model import LevTModel
+from levt.progress import HAS_RICH, TrainingDisplay
 from levt.trainer import DualPolicyTrainer
 
 
@@ -297,6 +298,12 @@ def main() -> None:
     resume_batch_index = next_batch_index
     final_epoch = start_epoch
     final_batch_index = resume_batch_index
+
+    # --- Rich progress display -------------------------------------------
+    display = None
+    if HAS_RICH:
+        display = TrainingDisplay(train_cfg.max_training_steps)
+
     for epoch in range(start_epoch, train_cfg.epochs):
         train_loader = make_loader(
             train_cfg.train_data,
@@ -345,8 +352,11 @@ def main() -> None:
             last_batch_index = window[-1][0]
             scaler.unscale_(adamw)
             scaler.unscale_(muon)
+            grad_norm = None
             if train_cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                )
             scaler.step(adamw)
             scaler.step(muon)
             scaler.update()
@@ -365,14 +375,32 @@ def main() -> None:
             final_batch_index = next_index
 
             if global_step % train_cfg.log_every_steps == 0:
-                print(
-                    f"step={global_step} epoch={epoch} "
-                    f"loss={metrics['loss_total']:.6f} lr_adamw={adamw_scheduler.get_last_lr()[0]:.8g} lr_muon={muon_scheduler.get_last_lr()[0]:.8g}",
-                    flush=True,
-                )
+                if display is not None:
+                    display.update(
+                        step=global_step,
+                        epoch=epoch,
+                        batch=last_batch_index + 1,
+                        batches_per_epoch=len(train_loader),
+                        loss_total=metrics["loss_total"],
+                        loss_plh=metrics["loss_ins_plh"],
+                        loss_tok=metrics["loss_ins_tok"],
+                        loss_del=metrics["loss_del"],
+                        lr_adamw=float(adamw_scheduler.get_last_lr()[0]),
+                        lr_muon=float(muon_scheduler.get_last_lr()[0]),
+                        grad_norm=grad_norm,
+                    )
+                else:
+                    print(
+                        f"step={global_step} epoch={epoch} "
+                        f"loss={metrics['loss_total']:.6f} lr_adamw={adamw_scheduler.get_last_lr()[0]:.8g} lr_muon={muon_scheduler.get_last_lr()[0]:.8g}",
+                        flush=True,
+                    )
             if validation_loader is not None and global_step % train_cfg.validate_every_steps == 0:
                 val_loss = evaluate(model, trainer, validation_loader, device, train_cfg.amp_dtype)
-                print(f"step={global_step} validation_loss={val_loss:.6f}", flush=True)
+                if display is not None:
+                    display.set_validation_loss(global_step, val_loss)
+                else:
+                    print(f"step={global_step} validation_loss={val_loss:.6f}", flush=True)
             if global_step % train_cfg.checkpoint_every_steps == 0:
                 write_checkpoints(
                     checkpoint_dir, global_step,
@@ -397,6 +425,8 @@ def main() -> None:
         epoch=final_epoch,
         next_batch_index=final_batch_index,
     )
+    if display is not None:
+        display.close()
     write_checkpoints(checkpoint_dir, global_step, payload)
     print(f"training complete: step={global_step}, checkpoint={checkpoint_dir / 'latest.pt'}")
 
