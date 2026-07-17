@@ -581,8 +581,8 @@ class LevTModel(nn.Module):
         )
 
         # ---- Classifier heads ----
-        self.deletion_head = nn.Linear(d_model, 2, bias=True)
-        self.placeholder_head = nn.Linear(2 * d_model, config.max_placeholder + 1, bias=True)
+        self.deletion_head = nn.Linear(d_model, 2, bias=False)
+        self.placeholder_head = nn.Linear(2 * d_model, config.max_placeholder + 1, bias=False)
 
         # Layer indices for early exit
         self._del_layer = (
