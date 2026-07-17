@@ -374,27 +374,26 @@ def main() -> None:
             final_epoch = next_epoch
             final_batch_index = next_index
 
-            if global_step % train_cfg.log_every_steps == 0:
-                if display is not None:
-                    display.update(
-                        step=global_step,
-                        epoch=epoch,
-                        batch=last_batch_index + 1,
-                        batches_per_epoch=len(train_loader),
-                        loss_total=metrics["loss_total"],
-                        loss_plh=metrics["loss_ins_plh"],
-                        loss_tok=metrics["loss_ins_tok"],
-                        loss_del=metrics["loss_del"],
-                        lr_adamw=float(adamw_scheduler.get_last_lr()[0]),
-                        lr_muon=float(muon_scheduler.get_last_lr()[0]),
-                        grad_norm=grad_norm,
-                    )
-                else:
-                    print(
-                        f"step={global_step} epoch={epoch} "
-                        f"loss={metrics['loss_total']:.6f} lr_adamw={adamw_scheduler.get_last_lr()[0]:.8g} lr_muon={muon_scheduler.get_last_lr()[0]:.8g}",
-                        flush=True,
-                    )
+            if display is not None:
+                display.update(
+                    step=global_step,
+                    epoch=epoch,
+                    batch=last_batch_index + 1,
+                    batches_per_epoch=len(train_loader),
+                    loss_total=metrics["loss_total"],
+                    loss_plh=metrics["loss_ins_plh"],
+                    loss_tok=metrics["loss_ins_tok"],
+                    loss_del=metrics["loss_del"],
+                    lr_adamw=float(adamw_scheduler.get_last_lr()[0]),
+                    lr_muon=float(muon_scheduler.get_last_lr()[0]),
+                    grad_norm=grad_norm,
+                )
+            elif global_step % train_cfg.log_every_steps == 0:
+                print(
+                    f"step={global_step} epoch={epoch} "
+                    f"loss={metrics['loss_total']:.6f} lr_adamw={adamw_scheduler.get_last_lr()[0]:.8g} lr_muon={muon_scheduler.get_last_lr()[0]:.8g}",
+                    flush=True,
+                )
             if validation_loader is not None and global_step % train_cfg.validate_every_steps == 0:
                 val_loss = evaluate(model, trainer, validation_loader, device, train_cfg.amp_dtype)
                 if display is not None:
