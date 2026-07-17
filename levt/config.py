@@ -256,6 +256,7 @@ class TrainConfig:
     validate_every_steps: int = 1000
     checkpoint_every_steps: int = 1000
     checkpoint_dir: str = "checkpoints"
+    log_csv_path: str = ""
     resume_from: Optional[str] = None
 
     def __post_init__(self) -> None:

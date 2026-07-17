@@ -35,5 +35,6 @@
   "validate_every_steps": 1000,
   "checkpoint_every_steps": 1000,
   "checkpoint_dir": "checkpoints",
+  "log_csv_path": "progress.csv",
   "resume_from": null
 }

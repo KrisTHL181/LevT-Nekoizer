@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import math
 import random
 from pathlib import Path
@@ -304,6 +305,21 @@ def main() -> None:
     if HAS_RICH:
         display = TrainingDisplay(train_cfg.max_training_steps)
 
+    # --- CSV progress log -------------------------------------------------
+    csv_file = None
+    csv_writer = None
+    if train_cfg.log_csv_path:
+        csv_path = Path(train_cfg.log_csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = csv_path.open("w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "step", "epoch", "batch",
+            "loss_total", "loss_ins_plh", "loss_ins_tok", "loss_del",
+            "lr_adamw", "lr_muon", "grad_norm", "val_loss",
+        ])
+        csv_file.flush()
+
     for epoch in range(start_epoch, train_cfg.epochs):
         train_loader = make_loader(
             train_cfg.train_data,
@@ -394,12 +410,27 @@ def main() -> None:
                     f"loss={metrics['loss_total']:.6f} lr_adamw={adamw_scheduler.get_last_lr()[0]:.8g} lr_muon={muon_scheduler.get_last_lr()[0]:.8g}",
                     flush=True,
                 )
+            val_loss_this_step = None
             if validation_loader is not None and global_step % train_cfg.validate_every_steps == 0:
-                val_loss = evaluate(model, trainer, validation_loader, device, train_cfg.amp_dtype)
+                val_loss_this_step = evaluate(model, trainer, validation_loader, device, train_cfg.amp_dtype)
                 if display is not None:
-                    display.set_validation_loss(global_step, val_loss)
+                    display.set_validation_loss(global_step, val_loss_this_step)
                 else:
-                    print(f"step={global_step} validation_loss={val_loss:.6f}", flush=True)
+                    print(f"step={global_step} validation_loss={val_loss_this_step:.6f}", flush=True)
+            if csv_file is not None:
+                assert csv_writer is not None
+                csv_writer.writerow([
+                    global_step, epoch, last_batch_index + 1,
+                    f"{metrics['loss_total']:.6f}",
+                    f"{metrics['loss_ins_plh']:.6f}",
+                    f"{metrics['loss_ins_tok']:.6f}",
+                    f"{metrics['loss_del']:.6f}",
+                    f"{adamw_scheduler.get_last_lr()[0]:.8g}",
+                    f"{muon_scheduler.get_last_lr()[0]:.8g}",
+                    f"{grad_norm:.6f}" if grad_norm is not None else "",
+                    f"{val_loss_this_step:.6f}" if val_loss_this_step is not None else "",
+                ])
+                csv_file.flush()
             if global_step % train_cfg.checkpoint_every_steps == 0:
                 write_checkpoints(
                     checkpoint_dir, global_step,
@@ -426,6 +457,8 @@ def main() -> None:
     )
     if display is not None:
         display.close()
+    if csv_file is not None:
+        csv_file.close()
     write_checkpoints(checkpoint_dir, global_step, payload)
     print(f"training complete: step={global_step}, checkpoint={checkpoint_dir / 'latest.pt'}")
 
