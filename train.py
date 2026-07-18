@@ -402,22 +402,31 @@ def main() -> None:
                 except StopIteration:
                     break
                 window.append((next_index_in_window, trainer.prepare_batch(next_batch)))
-            window_counts = {
-                name: sum(prepared.counts[name] for _, prepared in window)
-                for name in ("plh", "tok", "del")
-            }
+
+            # First pass: compute all losses and collect counts
+            results = []
             metric_sums = {"plh": 0.0, "tok": 0.0, "del": 0.0}
             for _, prepared in window:
                 with autocast_context(device, train_cfg.amp_dtype):
-                    sums, _ = trainer.loss_sums_and_counts(prepared)
-                    loss = sum(
-                        sums[name] / window_counts[name]
-                        if window_counts[name] else sums[name] * 0.0
-                        for name in sums
-                    )
-                scaler.scale(loss).backward()
+                    sums, batch_counts = trainer.loss_sums_and_counts(prepared)
+                results.append((sums, batch_counts))
                 for name in metric_sums:
                     metric_sums[name] += float(sums[name].detach())
+
+            # Aggregate total counts across the window
+            window_counts = {
+                name: sum(r[1][name] for r in results)
+                for name in ("plh", "tok", "del")
+            }
+
+            # Second pass: backward with normalized losses
+            for sums, _ in results:
+                loss = sum(
+                    sums[name] / window_counts[name]
+                    if window_counts[name] else sums[name] * 0.0
+                    for name in sums
+                )
+                scaler.scale(loss).backward()
             metrics = {
                 "loss_ins_plh": metric_sums["plh"] / window_counts["plh"] if window_counts["plh"] else 0.0,
                 "loss_ins_tok": metric_sums["tok"] / window_counts["tok"] if window_counts["tok"] else 0.0,

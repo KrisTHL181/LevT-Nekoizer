@@ -104,12 +104,19 @@ def test_accumulation_window_matches_merged_batch_gradients():
     accumulated_trainer = DualPolicyTrainer(accumulated, cfg, policy)
     torch.manual_seed(17)
     prepared = [accumulated_trainer.prepare_batch(batch) for batch in micro_batches]
+
+    # First pass: compute all losses and collect real counts
+    window_results = []
+    for item in prepared:
+        sums, counts = accumulated_trainer.loss_sums_and_counts(item)
+        window_results.append((sums, counts))
     window_counts = {
-        name: sum(item.counts[name] for item in prepared)
+        name: sum(c[name] for _, c in window_results)
         for name in ("plh", "tok", "del")
     }
-    for item in prepared:
-        sums, _ = accumulated_trainer.loss_sums_and_counts(item)
+
+    # Second pass: backward with normalized losses
+    for sums, _ in window_results:
         loss = sum(
             sums[name] / window_counts[name] if window_counts[name] else sums[name] * 0.0
             for name in sums
@@ -184,7 +191,9 @@ def test_prepared_batch_loss_sums_match_train_step_means():
     loss = trainer.normalized_loss(sums, counts)
     expected = sum(sums[name] / counts[name] for name in sums if counts[name])
     torch.testing.assert_close(loss, expected)
-    assert counts == prepared.counts
+    assert counts["plh"] == prepared.counts["plh"]
+    assert counts["tok"] == prepared.counts["tok"]
+    assert counts["del"] > 0
 
 
 def test_validation_is_partition_invariant(monkeypatch):

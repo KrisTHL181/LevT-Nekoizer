@@ -31,13 +31,15 @@ class PreparedBatch:
     t_star: List[torch.Tensor]
     y_del: List[torch.Tensor]
     d_star: List[torch.Tensor]
+    initial: List[torch.Tensor]
+    targets: List[torch.Tensor]
 
     @property
     def counts(self) -> Dict[str, int]:
         return {
             "plh": sum(oracle.numel() for oracle in self.p_star),
             "tok": sum(oracle.numel() for oracle in self.t_star),
-            "del": sum(max(0, sequence.numel() - 2) for sequence in self.y_del),
+            "del": 0,
         }
 
 
@@ -108,23 +110,8 @@ class DualPolicyTrainer:
             t_star = [item[2] for item in insertion]
             y_ins_plh = [item[3] for item in insertion]
 
-        with torch.no_grad():
-            memory = self.model.encode(src, src_mask)
-            model_filled = self._model_fill_batch(memory, src_mask, y_ins_plh)
-        y_del: List[torch.Tensor] = []
-        d_star: List[torch.Tensor] = []
-        for seed, filled, target in zip(initial, model_filled, targets):
-            roll_in = seed if torch.rand((), device="cpu").item() < self.policy.alpha else filled
-            roll_in = roll_in.detach().cpu()
-            y_del.append(roll_in)
-            d_star.append(oracle_deletion(
-                roll_in, target,
-                bos_idx=self.cfg.bos_token_id,
-                eos_idx=self.cfg.eos_token_id,
-            ))
-
         return PreparedBatch(
-            src, src_mask, y_ins, p_star, y_ins_plh, t_star, y_del, d_star,
+            src, src_mask, y_ins, p_star, y_ins_plh, t_star, [], [], initial, targets,
         )
 
     def loss_sums_and_counts(
@@ -134,11 +121,75 @@ class DualPolicyTrainer:
         device = next(self.model.parameters()).device
         memory = self.model.encode(prepared.src_tokens, prepared.src_padding_mask)
 
-        plh_tokens, plh_mask = self._pad(prepared.y_ins, device)
-        plh_out = self.model.decode_with_memory(
-            memory, plh_tokens, prepared.src_padding_mask, plh_mask,
-            return_deletion=False, return_placeholder=True, return_token=False,
-        )["plh_logits"]
+        # --- Deferred fill + deletion oracle (uses detached memory) ---
+        with torch.no_grad():
+            model_filled = self._model_fill_batch(
+                memory.detach(), prepared.src_padding_mask, prepared.y_ins_plh,
+            )
+
+        y_del: List[torch.Tensor] = []
+        d_star: List[torch.Tensor] = []
+        for seed, filled, target in zip(prepared.initial, model_filled, prepared.targets):
+            roll_in = seed if torch.rand((), device="cpu").item() < self.policy.alpha else filled
+            roll_in = roll_in.detach().cpu()
+            y_del.append(roll_in)
+            d_star.append(oracle_deletion(
+                roll_in, target,
+                bos_idx=self.cfg.bos_token_id,
+                eos_idx=self.cfg.eos_token_id,
+            ))
+
+        prepared.y_del = y_del
+        prepared.d_star = d_star
+
+        # --- Combined batched decoder pass for all three heads ---
+        bs = len(prepared.y_ins)
+
+        # Pad each group separately (kept for target creation)
+        plh_tokens, _ = self._pad(prepared.y_ins, device)
+        tok_tokens, _ = self._pad(prepared.y_ins_plh, device)
+        del_tokens, _ = self._pad(prepared.y_del, device)
+
+        # Determine max length across all three groups
+        max_len = max(plh_tokens.size(0), tok_tokens.size(0), del_tokens.size(0))
+
+        # Build combined tokens: (max_len, 3*bs)
+        combined = torch.full(
+            (max_len, 3 * bs), self.cfg.pad_token_id,
+            dtype=torch.long, device=device,
+        )
+        combined[:plh_tokens.size(0), :bs] = plh_tokens
+        combined[:tok_tokens.size(0), bs:2 * bs] = tok_tokens
+        combined[:del_tokens.size(0), 2 * bs:] = del_tokens
+
+        # Combined target padding mask: (3*bs, max_len)
+        combined_mask = combined.eq(self.cfg.pad_token_id).transpose(0, 1)
+
+        # Replicate source mask 3× along batch dim
+        src_mask_3x = prepared.src_padding_mask.repeat(3, 1)
+
+        # Replicate memory 3× so cross-attention batch dim matches the combined decoder
+        memory_3x = memory.repeat(1, 3, 1)
+
+        # Build token_positions mask for the tok slice only (columns bs:2*bs)
+        tok_pos_combined = torch.zeros((max_len, 3 * bs), dtype=torch.bool, device=device)
+        for batch_index, sequence in enumerate(prepared.y_ins_plh):
+            positions = sequence.eq(self.cfg.plh_token_id)
+            tok_pos_combined[:sequence.numel(), bs + batch_index] = positions.to(device)
+
+        # Single decoder call — return all three heads
+        out = self.model.decode_with_memory(
+            memory_3x, combined, src_mask_3x, combined_mask,
+            return_deletion=True, return_placeholder=True, return_token=True,
+            token_positions=tok_pos_combined,
+        )
+
+        # Split outputs back
+        plh_out = out["plh_logits"][:, :bs, :]       # (max_len-1, bs, plh_classes)
+        del_out = out["del_logits"][:, 2 * bs:, :]    # (max_len, bs, 2)
+        tok_out = out["tok_logits"]                   # already flattened by token_positions
+
+        # --- Target creation (unchanged logic) ---
         plh_targets = torch.full(plh_out.shape[:2], -100, dtype=torch.long, device=device)
         for batch_index, oracle in enumerate(prepared.p_star):
             expected = len(prepared.y_ins[batch_index]) - 1
@@ -146,13 +197,7 @@ class DualPolicyTrainer:
                 raise RuntimeError("placeholder oracle length does not match valid gap count")
             plh_targets[:expected, batch_index] = oracle.to(device)
 
-        tok_tokens, tok_mask = self._pad(prepared.y_ins_plh, device)
         tok_positions = tok_tokens.eq(self.cfg.plh_token_id)
-        tok_out = self.model.decode_with_memory(
-            memory, tok_tokens, prepared.src_padding_mask, tok_mask,
-            return_deletion=False, return_placeholder=False, return_token=True,
-            token_positions=tok_positions,
-        )["tok_logits"]
         tok_targets_full = torch.full(
             tok_tokens.shape, -100, dtype=torch.long, device=device,
         )
@@ -165,12 +210,7 @@ class DualPolicyTrainer:
             tok_targets_full[positions.to(device), batch_index] = oracle.to(device)
         tok_targets = tok_targets_full[tok_positions]
 
-        del_tokens, del_mask = self._pad(prepared.y_del, device)
-        del_out = self.model.decode_with_memory(
-            memory, del_tokens, prepared.src_padding_mask, del_mask,
-            return_deletion=True, return_placeholder=False, return_token=False,
-        )["del_logits"]
-        del_targets = torch.full(del_tokens.shape, -100, dtype=torch.long, device=device)
+        del_targets = torch.full(del_out.shape[:2], -100, dtype=torch.long, device=device)
         for batch_index, (sequence, oracle) in enumerate(zip(prepared.y_del, prepared.d_star)):
             if oracle.numel() != sequence.numel():
                 raise RuntimeError("deletion oracle length does not match roll-in length")
@@ -182,7 +222,12 @@ class DualPolicyTrainer:
             "tok": self._cross_entropy_sum(tok_out, tok_targets, self.policy.label_smoothing),
             "del": self._cross_entropy_sum(del_out, del_targets, 0.0),
         }
-        return sums, prepared.counts
+        counts = {
+            "plh": sum(oracle.numel() for oracle in prepared.p_star),
+            "tok": sum(oracle.numel() for oracle in prepared.t_star),
+            "del": sum(max(0, sequence.numel() - 2) for sequence in y_del),
+        }
+        return sums, counts
 
     @staticmethod
     def normalized_loss(
