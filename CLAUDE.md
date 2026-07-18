@@ -52,9 +52,9 @@ schema owning:
 - Hugging Face model source, `local_files_only`, `trust_remote_code`, import
   dtype, and embedding freezing;
 - dual-policy alpha/beta, random deletion, and label smoothing;
-- AdamW, warmup/linear-decay schedule;
-- device, AMP, accumulation, clipping, logging, validation, checkpoints, and
-  resume path.
+- AdamW and Muon optimizers with warmup/linear-decay schedule;
+- device, AMP, accumulation, clipping, logging, validation, checkpoints,
+  resume path, early stopping, and checkpoint retention.
 
 ## Data
 
@@ -131,6 +131,26 @@ Training shuffle order is deterministic per epoch, so an optimizer-boundary
 checkpoint resumes without replaying prior batches. Resume verifies exact model
 config before restoring state. Validation uses a fixed temporary RNG state and
 restores the training RNG afterward.
+
+### Early stopping
+
+`early_stopping_patience` (default 0, disabled) sets how many consecutive
+validation checks without improvement trigger training termination. The
+best validation loss and its step are tracked throughout training; a lower
+loss resets the counter. When the patience threshold is reached, training
+stops and a message is printed with the best-loss details.
+
+### Checkpoint cleanup
+
+`keep_last_checkpoints` (default 0, keep all) limits the number of numbered
+`step_*.pt` files in the checkpoint directory. The checkpoint with the lowest
+recorded validation loss is **always preserved** regardless of age; on top of
+that, the *N* most-recent checkpoints (by highest step number) are retained.
+Cleanup runs after every checkpoint save (including the final one). When both
+are zero (the defaults), behaviour is unchanged from earlier versions.
+
+The Rich display shows a patience counter (`X/Y`) when early stopping is
+active, coloured yellow while below threshold and red when triggered.
 
 ## Expert and inference
 

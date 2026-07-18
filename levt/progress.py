@@ -53,6 +53,8 @@ class TrainingDisplay:
         self._last: dict = {}
         self._val_loss: Optional[tuple[int, float]] = None   # (step, loss)
         self._best_val: Optional[tuple[int, float]] = None   # (step, loss)
+        self._patience_used: int = 0
+        self._patience_total: int = 0
 
     # -- public API --------------------------------------------------------
 
@@ -95,6 +97,11 @@ class TrainingDisplay:
             self._best_val = (step, loss)
         if self._last:
             self._render()
+
+    def set_early_stopping(self, steps_since: int, patience: int) -> None:
+        """Update the early-stopping patience counter (0 = disabled)."""
+        self._patience_used = steps_since
+        self._patience_total = patience
 
     def close(self) -> None:
         """Stop the live display so further output is unadorned."""
@@ -161,6 +168,13 @@ class TrainingDisplay:
             if self._best_val is not None and abs(vl - self._best_val[1]) < 1e-9:
                 val_text += "  [green]★ best[/green]"
             table.add_row("Val Loss", val_text)
+
+        if self._patience_total > 0:
+            colour = "red" if self._patience_used >= self._patience_total else "yellow"
+            table.add_row(
+                "Patience",
+                f"[{colour}]{self._patience_used}/{self._patience_total}[/{colour}]",
+            )
 
         table.add_row(
             "Time",

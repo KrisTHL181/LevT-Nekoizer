@@ -17,7 +17,13 @@ from torch.optim import AdamW, Muon
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from levt.checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, save_checkpoint
+from levt.checkpoint import (
+    capture_rng_state,
+    cleanup_checkpoints,
+    load_checkpoint,
+    restore_rng_state,
+    save_checkpoint,
+)
 from levt.config import LevTConfig, TrainConfig
 from levt.data import JsonlDataset, LevTCollator
 from levt.embeddings import import_hf_embeddings
@@ -299,6 +305,11 @@ def main() -> None:
     resume_batch_index = next_batch_index
     final_epoch = start_epoch
     final_batch_index = resume_batch_index
+    best_val_loss = float("inf")
+    best_val_step: Optional[int] = None
+    steps_since_improvement = 0
+    current_val_loss: Optional[float] = None
+    checkpoint_val_loss: Dict[int, float] = {}
 
     # --- Rich progress display -------------------------------------------
     display = None
@@ -413,10 +424,28 @@ def main() -> None:
             val_loss_this_step = None
             if validation_loader is not None and global_step % train_cfg.validate_every_steps == 0:
                 val_loss_this_step = evaluate(model, trainer, validation_loader, device, train_cfg.amp_dtype)
+                current_val_loss = val_loss_this_step
+                if val_loss_this_step < best_val_loss:
+                    best_val_loss = val_loss_this_step
+                    best_val_step = global_step
+                    steps_since_improvement = 0
+                else:
+                    steps_since_improvement += 1
                 if display is not None:
                     display.set_validation_loss(global_step, val_loss_this_step)
+                    display.set_early_stopping(
+                        steps_since_improvement, train_cfg.early_stopping_patience,
+                    )
                 else:
                     print(f"step={global_step} validation_loss={val_loss_this_step:.6f}", flush=True)
+                if train_cfg.early_stopping_patience > 0 and steps_since_improvement >= train_cfg.early_stopping_patience:
+                    print(
+                        f"early stopping at step {global_step}: "
+                        f"no improvement for {steps_since_improvement} validations "
+                        f"(best val_loss={best_val_loss:.6f} at step {best_val_step})",
+                        flush=True,
+                    )
+                    break
             if csv_file is not None:
                 assert csv_writer is not None
                 csv_writer.writerow([
@@ -442,6 +471,13 @@ def main() -> None:
                         next_batch_index=next_index,
                     ),
                 )
+                if current_val_loss is not None:
+                    checkpoint_val_loss[global_step] = current_val_loss
+                if train_cfg.keep_last_checkpoints > 0:
+                    cleanup_checkpoints(
+                        checkpoint_dir, train_cfg.keep_last_checkpoints,
+                        checkpoint_val_loss,
+                    )
             if global_step >= train_cfg.max_training_steps:
                 break
         resume_batch_index = 0
@@ -459,7 +495,14 @@ def main() -> None:
         display.close()
     if csv_file is not None:
         csv_file.close()
+    if current_val_loss is not None:
+        checkpoint_val_loss[global_step] = current_val_loss
     write_checkpoints(checkpoint_dir, global_step, payload)
+    if train_cfg.keep_last_checkpoints > 0:
+        cleanup_checkpoints(
+            checkpoint_dir, train_cfg.keep_last_checkpoints,
+            checkpoint_val_loss,
+        )
     print(f"training complete: step={global_step}, checkpoint={checkpoint_dir / 'latest.pt'}")
 
 

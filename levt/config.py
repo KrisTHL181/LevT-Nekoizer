@@ -258,6 +258,8 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     log_csv_path: str = ""
     resume_from: Optional[str] = None
+    early_stopping_patience: int = 0
+    keep_last_checkpoints: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.train_data, str) or not self.train_data:
@@ -308,6 +310,8 @@ class TrainConfig:
         if not isinstance(self.muon_nesterov, bool):
             raise ValueError("muon_nesterov must be a boolean")
         _positive_int("muon_ns_steps", self.muon_ns_steps)
+        _positive_int("early_stopping_patience", self.early_stopping_patience, allow_zero=True)
+        _positive_int("keep_last_checkpoints", self.keep_last_checkpoints, allow_zero=True)
 
     @property
     def policy(self) -> PolicyConfig:

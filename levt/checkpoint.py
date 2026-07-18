@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import os
 import random
+import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
 
 CHECKPOINT_VERSION = 1
+
+_STEP_PATTERN = re.compile(r"^step_(\d+)\.pt$")
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -37,6 +40,60 @@ def save_checkpoint(path: str | Path, payload: Dict[str, Any]) -> None:
     temporary = path.with_name(path.name + ".tmp")
     torch.save(final_payload, temporary)
     os.replace(temporary, path)
+
+
+def cleanup_checkpoints(
+    directory: Path,
+    keep_last: int,
+    checkpoint_val_loss: Dict[int, float],
+) -> None:
+    """Remove old checkpoints, keeping the best (by eval loss) and last *N*.
+
+    Args:
+        directory: Checkpoint directory to scan.
+        keep_last: Number of most-recent checkpoints (by step number) to retain.
+            Values ≤ 0 are a no-op.
+        checkpoint_val_loss: Mapping of ``step → eval_loss`` for every saved
+            checkpoint.  The step with the smallest loss is always preserved.
+            Checkpoint steps not present in this mapping are not eligible for
+            best-checkpoint protection (but may still be kept as part of the
+            last-*N* window).
+    """
+    if keep_last <= 0:
+        return
+
+    pattern = "step_*.pt"
+    checkpoint_files = sorted(directory.glob(pattern))
+    if not checkpoint_files:
+        return
+
+    step_files: list[tuple[int, Path]] = []
+    for fp in checkpoint_files:
+        m = _STEP_PATTERN.match(fp.name)
+        if m is None:
+            continue
+        step_files.append((int(m.group(1)), fp))
+
+    if not step_files:
+        return
+
+    step_files.sort(key=lambda x: x[0])
+
+    valid_steps = {s for s, _ in step_files}
+    valid_val_loss = {s: v for s, v in checkpoint_val_loss.items() if s in valid_steps}
+
+    keep_steps: set[int] = set()
+
+    if valid_val_loss:
+        best_step = min(valid_val_loss, key=valid_val_loss.__getitem__)
+        keep_steps.add(best_step)
+
+    for step, _ in step_files[-keep_last:]:
+        keep_steps.add(step)
+
+    for step, filepath in step_files:
+        if step not in keep_steps:
+            filepath.unlink()
 
 
 def load_checkpoint(path: str | Path, *, map_location: Any = "cpu") -> Dict[str, Any]:
