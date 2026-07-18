@@ -13,7 +13,6 @@ from typing import Any, Dict, Iterable, Optional
 
 import torch
 import torch.nn as nn
-from torch.optim import AdamW, Muon
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
@@ -28,6 +27,7 @@ from levt.config import LevTConfig, TrainConfig
 from levt.data import JsonlDataset, LevTCollator
 from levt.embeddings import import_hf_embeddings
 from levt.model import LevTModel
+from levt.perf_optims import accelerated, enable_all, prealloc_model_grads
 from levt.progress import HAS_RICH, TrainingDisplay
 from levt.trainer import DualPolicyTrainer
 
@@ -149,14 +149,14 @@ def build_optimizers(
     if not adamw_params:
         raise ValueError("no non-Linear parameters found for AdamW optimizer")
 
-    adamw = AdamW(
+    adamw = accelerated.AdamW(
         adamw_params,
         lr=train_cfg.learning_rate,
         weight_decay=train_cfg.weight_decay,
         betas=train_cfg.betas,
         eps=train_cfg.eps,
     )
-    muon = Muon(
+    muon = accelerated.Muon(
         muon_params,
         lr=train_cfg.muon_lr,
         weight_decay=train_cfg.muon_weight_decay,
@@ -242,6 +242,7 @@ def main() -> None:
     train_cfg = TrainConfig.from_json(args.train_config)
     device = resolve_device(train_cfg.device)
     seed_everything(train_cfg.seed)
+    enable_all()
 
     validation_loader = (
         make_loader(train_cfg.validation_data, model_cfg, train_cfg, shuffle=False)
@@ -273,6 +274,9 @@ def main() -> None:
         )
     model.to(device)
     model.shared_embedding.weight.requires_grad_(not train_cfg.freeze_embeddings)
+
+    prealloc_model_grads(model)
+    model = torch.compile(model, fullgraph=True)
 
     trainer = DualPolicyTrainer(model, model_cfg, train_cfg.policy)
     adamw, muon = build_optimizers(model, train_cfg)
@@ -382,7 +386,7 @@ def main() -> None:
             grad_norm = None
             if train_cfg.max_grad_norm > 0:
                 grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                    accelerated.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
                 )
             scaler.step(adamw)
             scaler.step(muon)
