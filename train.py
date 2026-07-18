@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
+from levt._levenshtein_ops import verify_cpp_extension
 from levt.checkpoint import (
     capture_rng_state,
     cleanup_checkpoints,
@@ -38,6 +39,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-config", default="train_config.json")
     parser.add_argument("--resume", default=None, help="checkpoint path; overrides train_config")
     return parser.parse_args()
+
+
+def _check_cpp_extension() -> None:
+    """Verify the C++ Levenshtein extension works before training starts.
+
+    A silent fallback to pure Python costs ~3.5× throughput and wastes GPU
+    resources.  This check runs a real smoke test and exits with a clear
+    diagnostic if the extension is unavailable.
+    """
+    import os
+    import sys
+
+    status = verify_cpp_extension()
+    if status.available:
+        return  # all good
+
+    separator = "=" * 72
+    print(f"\n{separator}", file=sys.stderr)
+    print("  FATAL — C++ Levenshtein extension is NOT available", file=sys.stderr)
+    print(separator, file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  Reason: {status.error}", file=sys.stderr)
+    if status.fix_hint:
+        print(f"  Fix:    {status.fix_hint}", file=sys.stderr)
+    print(file=sys.stderr)
+    print("  Training will be ~3.5× slower with pure-Python DP.", file=sys.stderr)
+    print("  GPU utilisation will stay at ~20 % instead of >80 %.", file=sys.stderr)
+    print(file=sys.stderr)
+    print("  If you MUST proceed with pure Python (e.g. no compiler", file=sys.stderr)
+    print("  available), set the environment variable:", file=sys.stderr)
+    print("      LEVT_ALLOW_PYTHON_DP=1", file=sys.stderr)
+    print(file=sys.stderr)
+    print(separator, file=sys.stderr)
+
+    if os.environ.get("LEVT_ALLOW_PYTHON_DP") == "1":
+        print("  LEVT_ALLOW_PYTHON_DP=1 is set — proceeding anyway.", file=sys.stderr)
+        print(separator, file=sys.stderr)
+        return
+
+    sys.exit(1)
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -243,6 +284,9 @@ def main() -> None:
     device = resolve_device(train_cfg.device)
     seed_everything(train_cfg.seed)
     enable_all()
+
+    # --- Pre-flight: verify C++ Levenshtein extension -------------------
+    _check_cpp_extension()
 
     validation_loader = (
         make_loader(train_cfg.validation_data, model_cfg, train_cfg, shuffle=False)
