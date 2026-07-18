@@ -32,9 +32,13 @@ class GreedyDecoder:
         outputs = decoder.decode_batch(src_batch, y0_batch)
     """
 
-    def __init__(self, model: LevTModel, config: LevTConfig):
+    def __init__(self, model: LevTModel, config: LevTConfig,
+                 temperature: float = 0.0):
         self.model = model
         self.cfg = config
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        self.temperature = float(temperature)
 
     # ------------------------------------------------------------------
     # Single-sequence decoding
@@ -159,6 +163,20 @@ class GreedyDecoder:
         return outputs, iterations
 
     # ------------------------------------------------------------------
+    # Sampling helper
+    # ------------------------------------------------------------------
+
+    def _sample(self, logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Sample from logits with temperature scaling.
+
+        When ``temperature == 0`` this is equivalent to argmax.
+        """
+        if self.temperature == 0.0:
+            return logits.argmax(dim=dim)
+        probs = torch.softmax(logits / self.temperature, dim=dim)
+        return torch.multinomial(probs, num_samples=1).squeeze(dim)
+
+    # ------------------------------------------------------------------
     # Phase implementations
     # ------------------------------------------------------------------
 
@@ -168,7 +186,7 @@ class GreedyDecoder:
         y: torch.Tensor,
         src_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Apply deletion policy: argmax π^del → keep only tokens predicted as 'keep'."""
+        """Apply deletion policy: sample / argmax π^del → keep only tokens predicted as 'keep'."""
         y_t = y.unsqueeze(1)  # (T, 1)
         tgt_mask = torch.zeros(1, len(y), dtype=torch.bool, device=y.device)
 
@@ -179,7 +197,7 @@ class GreedyDecoder:
         del_logits = out["del_logits"]  # (T, 1, 2)
 
         # Class 0 = keep, Class 1 = delete
-        del_preds = del_logits.squeeze(1).argmax(dim=-1)  # (T,)
+        del_preds = self._sample(del_logits.squeeze(1), dim=-1)  # (T,)
         del_preds = del_preds.bool()  # True = delete
 
         # Never delete boundaries
@@ -194,7 +212,7 @@ class GreedyDecoder:
         y: torch.Tensor,
         src_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Apply placeholder policy: argmax π^plh → insert <PLH> tokens."""
+        """Apply placeholder policy: sample / argmax π^plh → insert <PLH> tokens."""
         y_t = y.unsqueeze(1)
         tgt_mask = torch.zeros(1, len(y), dtype=torch.bool, device=y.device)
 
@@ -209,7 +227,7 @@ class GreedyDecoder:
             plh_logits = plh_logits.clone()
             plh_logits[:, :, 0] = plh_logits[:, :, 0] - self.cfg.placeholder_penalty
 
-        p_preds = plh_logits.squeeze(1).argmax(dim=-1)  # (T-1,)
+        p_preds = self._sample(plh_logits.squeeze(1), dim=-1)  # (T-1,)
 
         # Build sequence with placeholders
         y_list = y.tolist()
@@ -229,7 +247,7 @@ class GreedyDecoder:
         y_with_plh: torch.Tensor,
         src_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Apply token policy: argmax π^tok → replace <PLH> with predicted tokens."""
+        """Apply token policy: sample / argmax π^tok → replace <PLH> with predicted tokens."""
         y_t = y_with_plh.unsqueeze(1)
         tgt_mask = torch.zeros(1, len(y_with_plh), dtype=torch.bool, device=y_with_plh.device)
 
@@ -245,7 +263,7 @@ class GreedyDecoder:
             self.cfg.eos_token_id, self.cfg.plh_token_id,
         }
         tok_logits[:, list(reserved)] = float("-inf")
-        tok_preds = tok_logits.argmax(dim=-1)
+        tok_preds = self._sample(tok_logits, dim=-1)
 
         result = y_with_plh.clone()
         result[result.eq(self.cfg.plh_token_id)] = tok_preds
