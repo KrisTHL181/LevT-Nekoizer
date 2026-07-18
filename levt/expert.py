@@ -17,6 +17,14 @@ from typing import List, Tuple
 
 import torch
 
+# Try to load the C++ acceleration module at import time.
+_cpp_module = None
+try:
+    from ._levenshtein_ops import levenshtein_align_cpp
+    _cpp_module = True  # module loaded; actual function may still return None
+except ImportError:
+    levenshtein_align_cpp = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Levenshtein DP alignment (insert + delete only, no substitution)
@@ -33,6 +41,8 @@ def levenshtein_align(
     Operations: DELETE (cost 1), INSERT (cost 1), MATCH (cost 0 if tokens equal).
     No substitution — changing a token requires DELETE + INSERT (cost 2).
 
+    Tries the C++ extension first; falls back to pure Python seamlessly.
+
     Args:
         y:      current sequence, shape (L,) — includes BOS/EOS
         y_star: target sequence, shape (M,) — includes BOS/EOS
@@ -46,6 +56,21 @@ def levenshtein_align(
 
     NOTE: Boundary tokens (first and last) are never deleted.
     """
+    # ── Fast path: C++ extension ────────────────────────────────────
+    if levenshtein_align_cpp is not None:
+        result = levenshtein_align_cpp(y.tolist(), y_star.tolist())
+        if result is not None:
+            return result
+
+    # ── Fallback: pure Python DP ────────────────────────────────────
+    return _levenshtein_align_py(y, y_star)
+
+
+def _levenshtein_align_py(
+    y: torch.Tensor,
+    y_star: torch.Tensor,
+) -> Tuple[List[int], List[List[int]]]:
+    """Pure-Python DP implementation (kept as fallback)."""
     y_list = y.tolist()
     ys_list = y_star.tolist()
     n, m = len(y_list), len(ys_list)
@@ -90,12 +115,9 @@ def levenshtein_align(
 
     # Backtrack through DP
     deletions: List[int] = []
-    # matched_pairs: list of (idx_in_y, idx_in_y_star) for matched positions
     matched_pairs: List[Tuple[int, int]] = []
 
     i, j = n, m
-    inserted_segments: List[Tuple[int, int, int]] = []  # (insert_before_y_idx, start_j, end_j)
-
     while i > 0 or j > 0:
         op = back[i, j].item()
         if op == 0:  # match
@@ -107,19 +129,16 @@ def levenshtein_align(
             deletions.append(i)
         else:  # insert
             j -= 1
-            # We'll reconstruct insertion groups after backtrack
 
-    # Reverse to get forward order
     deletions.reverse()
     matched_pairs.reverse()
 
-    # Reconstruct insertion groups from the DP alignment
     # Re-backtrack to collect insertions between matched positions
-    insertions_raw: List[int] = []  # tokens from y* that are inserted, in order
-    insertion_after: List[int] = []  # y-index (in matched positions) after which they appear
+    insertions_raw: List[int] = []
+    insertion_after: List[int] = []
 
     i, j = n, m
-    current_after = n  # tracks where in y we are (before any match)
+    current_after = n
     while i > 0 or j > 0:
         op = back[i, j].item()
         if op == 0:  # match
@@ -136,45 +155,22 @@ def levenshtein_align(
     insertions_raw.reverse()
     insertion_after.reverse()
 
-    # Build per-slot insertion lists
-    # The slots are gaps in the ORIGINAL y (before deletion), indexed by
-    # the position BEFORE the gap (0..n-1 for pairs 0|1, 1|2, ..., n-2|n-1)
-    # But tokens at deleted positions are removed, so we need to map to
-    # gaps between SURVIVING positions.
-
-    # Strategy: for each gap i in the original y (between pos i and i+1),
-    # collect inserted tokens. If pos i+1 is deleted, the gap spans further.
-
-    # Simplified: group inserted tokens by the gap AFTER the preceding
-    # non-deleted position.
     del_set = set(deletions)
     surviving = [idx for idx in range(n) if idx not in del_set]
-
-    # Build insertion lists: insertions_by_gap[i] for gap after surviving[i]
     per_gap: List[List[int]] = [[] for _ in range(max(0, len(surviving) - 1))]
 
     if len(surviving) >= 2:
-        # Map from y-index to surviving-index
         surv_rank = {sid: si for si, sid in enumerate(surviving)}
-
         for tok, after_y in zip(insertions_raw, insertion_after):
-            # Backward-pass semantics: after_y is the *next* matched y-index
-            # in the forward direction. The inserted token goes in the gap
-            # BEFORE position after_y, i.e. between the previous surviving
-            # token and after_y.  So we find the surviving index where
-            # surviving[si] == after_y, and assign the token to gap si-1.
             gap_surv_idx = -1
             if after_y in surv_rank:
-                gap_surv_idx = surv_rank[after_y] - 1  # gap before this position
+                gap_surv_idx = surv_rank[after_y] - 1
             else:
-                # after_y points to a deleted position — find the gap after
-                # the last surviving token before after_y.
                 for si in range(len(surviving)):
                     if surviving[si] < after_y:
                         gap_surv_idx = si
                     else:
                         break
-
             if 0 <= gap_surv_idx < len(per_gap):
                 per_gap[gap_surv_idx].append(tok)
 
