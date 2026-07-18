@@ -3,7 +3,7 @@
   "pad_token_id": 0,
   "bos_token_id": 1,
   "eos_token_id": 2,
-  "plh_token_id": 3,
+  "plh_token_id": 73446,
   "embedding_dim": 1024,
   "d_model": 512,
   "n_heads": 8,
