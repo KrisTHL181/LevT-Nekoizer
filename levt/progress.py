@@ -98,6 +98,12 @@ class TrainingDisplay:
         if self._last:
             self._render()
 
+    def set_total(self, total: int) -> None:
+        """Update the total step count so the progress bar reflects the real
+        training boundary (e.g. capped by both ``max_training_steps`` *and*
+        ``epochs``)."""
+        self.total_steps = max(total, 1)
+
     def set_early_stopping(self, steps_since: int, patience: int) -> None:
         """Update the early-stopping patience counter (0 = disabled)."""
         self._patience_used = steps_since

@@ -389,6 +389,19 @@ def main() -> None:
         )
         if resume_batch_index > len(train_loader):
             raise ValueError("checkpoint batch position exceeds the epoch length")
+        if display is not None and epoch == start_epoch:
+            # Compute the real training ceiling: max_training_steps _or_
+            # epoch exhaustion — whichever comes first.  The progress bar
+            # then shows "how far through what we'll actually run."
+            steps_per_epoch = math.ceil(
+                len(train_loader) / train_cfg.gradient_accumulation_steps
+            )
+            remaining_epochs = train_cfg.epochs - start_epoch
+            actual_total = min(
+                train_cfg.max_training_steps,
+                remaining_epochs * steps_per_epoch,
+            )
+            display.set_total(actual_total)
         train_iterator = iter(enumerate(train_loader))
         for batch_index, batch in train_iterator:
             if global_step >= train_cfg.max_training_steps:
