@@ -18,6 +18,10 @@ latest.pt
 # Rust build artifacts
 target/
 
+# Training visualization artifacts
+progress.csv
+*.html
+
 # IDE
 .idea/
 .vscode/
