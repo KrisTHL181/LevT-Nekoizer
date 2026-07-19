@@ -300,17 +300,29 @@ def _build_phase_line(
                     coloured_parts.append(f"{_BRIGHT_GREEN}{lbl}{_RESET}")
                     annotations.append(f"{_BRIGHT_GREEN}{ICON_ADD} {_token_to_str(t, config)}{_RESET}")
         elif tag == "replace":
-            for t in before_ids[i1:i2]:
-                annotations.append(f"{_RED}{_STRIKE}{ICON_DEL} {_token_to_str(t, config)}{_RESET}")
-            for k in range(j1, j2):
-                t = after_ids[k]
-                lbl = after_labels[k]
-                if t == plh:
-                    coloured_parts.append(f"{_BRIGHT_YELLOW}{lbl}{_RESET}")
-                    annotations.append(f"{_BRIGHT_YELLOW}{ICON_ADD} «PLH»{_RESET}")
-                else:
-                    coloured_parts.append(f"{_BRIGHT_GREEN}{lbl}{_RESET}")
-                    annotations.append(f"{_BRIGHT_GREEN}{ICON_ADD} {_token_to_str(t, config)}{_RESET}")
+            if phase == "fill":
+                # Fill phase: PLH → token is a *fill*, not a delete+insert.
+                for k in range(j1, j2):
+                    t = after_ids[k]
+                    lbl = after_labels[k]
+                    if t == plh:
+                        coloured_parts.append(f"{_BRIGHT_YELLOW}{lbl}{_RESET}")
+                    else:
+                        coloured_parts.append(f"{_BRIGHT_GREEN}{lbl}{_RESET}")
+                        annotations.append(f"{_BRIGHT_GREEN}{ICON_FILL} {_token_to_str(t, config)}{_RESET}")
+            else:
+                # Del / plh phases: genuine replace = delete old + insert new.
+                for t in before_ids[i1:i2]:
+                    annotations.append(f"{_RED}{_STRIKE}{ICON_DEL} {_token_to_str(t, config)}{_RESET}")
+                for k in range(j1, j2):
+                    t = after_ids[k]
+                    lbl = after_labels[k]
+                    if t == plh:
+                        coloured_parts.append(f"{_BRIGHT_YELLOW}{lbl}{_RESET}")
+                        annotations.append(f"{_BRIGHT_YELLOW}{ICON_ADD} «PLH»{_RESET}")
+                    else:
+                        coloured_parts.append(f"{_BRIGHT_GREEN}{lbl}{_RESET}")
+                        annotations.append(f"{_BRIGHT_GREEN}{ICON_ADD} {_token_to_str(t, config)}{_RESET}")
 
     return " ".join(coloured_parts), annotations
 
