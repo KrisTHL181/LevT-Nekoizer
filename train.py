@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-config", default="config.json")
     parser.add_argument("--train-config", default="train_config.json")
     parser.add_argument("--resume", default=None, help="checkpoint path; overrides train_config")
+    parser.add_argument(
+        "--resume-csv", default=None,
+        help="append to this CSV progress file instead of overwriting it",
+    )
     return parser.parse_args()
 
 
@@ -367,16 +371,20 @@ def main() -> None:
     # --- CSV progress log -------------------------------------------------
     csv_file = None
     csv_writer = None
-    if train_cfg.log_csv_path:
-        csv_path = Path(train_cfg.log_csv_path)
+    csv_append = args.resume_csv is not None
+    csv_path_str = args.resume_csv or train_cfg.log_csv_path
+    if csv_path_str:
+        csv_path = Path(csv_path_str)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        csv_file = csv_path.open("w", newline="")
+        csv_mode = "a" if csv_append else "w"
+        csv_file = csv_path.open(csv_mode, newline="")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow([
-            "step", "epoch", "batch",
-            "loss_total", "loss_ins_plh", "loss_ins_tok", "loss_del",
-            "lr_adamw", "lr_muon", "grad_norm", "val_loss",
-        ])
+        if not csv_append:
+            csv_writer.writerow([
+                "step", "epoch", "batch",
+                "loss_total", "loss_ins_plh", "loss_ins_tok", "loss_del",
+                "lr_adamw", "lr_muon", "grad_norm", "val_loss",
+            ])
         csv_file.flush()
 
     for epoch in range(start_epoch, train_cfg.epochs):

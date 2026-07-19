@@ -110,7 +110,11 @@ python train.py --model-config config.json --train-config train_config.json
 
 This is single-machine, single-GPU or CPU training. CUDA FP16 alone uses
 GradScaler; BF16 uses autocast without scaling. It supports accumulation,
-clipping, validation, warmup plus linear decay, and periodic logging.
+clipping, validation, warmup plus linear decay, periodic logging, and optional
+CSV progress logging (`log_csv_path`). `--resume <checkpoint>` restores model,
+optimizer, scheduler, scaler, and RNG state from a checkpoint. `--resume-csv
+<path>` opens an existing CSV in append mode instead of overwriting, preserving
+prior progress rows.
 
 **Optimizers**: `nn.Linear.weight` parameters use Muon; all other parameters
 (biases, RMSNorm weights, embedding weights) use AdamW. `build_optimizers()`
