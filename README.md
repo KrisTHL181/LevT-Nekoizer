@@ -1,154 +1,195 @@
-# Levenshtein Transformer (LevT)
+# LevT-Nekoizer
 
-A PyTorch implementation of the Levenshtein Transformer (Gu, Wang, Zhao,
-NeurIPS 2019). The model refines a sequence with deletion, placeholder
-insertion, and placeholder filling operations.
+A Levenshtein Transformer that rewrites any Chinese text into catgirl-speak.
+Trained on 207k Zhihu answer pairs — takes boring, serious prose and injects
+the playful, mischievous tone of a Neko.
 
-## Architecture
+📝 **[Read the full backstory (Chinese)](https://zhuanlan.zhihu.com/p/2062297940572500896)**
 
-The encoder and bidirectional decoder share one vocabulary embedding. Both
-sides always have their own bias-free `embedding_dim -> d_model` projection,
-even when the dimensions are equal. Token logits have no standalone output
-parameter:
+> **Input:** 我们厌倦了知乎上千篇一律的严肃长文和各种爹味说教。为了净化眼球，我们开发了这个模型。
+>
+> **Output:** 人家厌倦了知乎上上千篇一律的严肃长文和各种爹味说教喵。为了净化眼球，人家就开发出了这个模型喵。
+
+Instead of generating left-to-right, the model iteratively refines text through
+three operations: **delete** what doesn't belong, **insert placeholders** where
+new tokens are needed, and **fill** those placeholders with actual words. Each
+pass improves the sequence — rinse and repeat until the text is sufficiently
+nyaa.
+
+## Quick Start
+
+### Get the model
+
+Pretrained weights are on Hugging Face:
+
+🔗 **[KrisTHL181/LevT-Nekoizer](https://huggingface.co/KrisTHL181/LevT-Nekoizer)**
+
+### Get the code
+
+```bash
+git clone https://github.com/KrisTHL181/LevT-Nekoizer.git
+cd LevT-Nekoizer
+```
+
+### Tokenizer
+
+The model uses the tokenizer from **MiniCPM4-0.5B** (`openbmb/MiniCPM4-0.5B`).
+The vocabulary has 73,448 Chinese + English tokens. The model's embedding table
+was initialized from MiniCPM4-0.5B's pretrained embeddings and projected down
+from 1024 → 512 dimensions.
+
+You'll need the tokenizer to encode input text and decode model output:
 
 ```python
-projected = F.linear(hidden, model.decoder_input_projection.weight.T)
-logits = F.linear(projected, model.shared_embedding.weight)
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(
+    'openbmb/MiniCPM4-0.5B', trust_remote_code=True
+)
 ```
 
-Deletion and placeholder prediction use ordinary classifier heads. Decoder
-states and masks are seq-first: token tensors are `(length, batch)` and padding
-masks are `(batch, length)`, where `True` means padding.
+### Install
 
-## Data
-
-Training and validation data are JSONL. Every row has exactly these keys:
-
-```json
-{"src": [4, 5, 6], "target": [1, 9, 10, 2], "initial": [1, 2]}
+```bash
+pip install torch transformers huggingface_hub
 ```
 
-- `src` and `target` are required.
-- `initial` is optional and defaults to `[bos_token_id, eos_token_id]`.
-- Values must be nonempty lists of integer token IDs. Boolean values are not
-  integers for validation purposes.
-- IDs must be in range. Padding and placeholder IDs are not accepted in raw
-  rows. Target and initial sequences must start with BOS, end with EOS, and
-  contain no interior BOS/EOS.
-- Unknown row keys, blank lines, malformed JSON, and configured length
-  overflows are errors. No row is truncated.
-
-No tokenizer is loaded. Input JSONL must already contain token IDs compatible
-with the configured vocabulary and imported embedding table.
-
-## Configuration
-
-`config.json` owns model architecture and special IDs only. Unknown keys are
-rejected. Boolean switches require JSON booleans, and numeric settings must be
-finite; `rope_base` must additionally be positive. `embedding_dim` defaults to
-`d_model` for older Python callers.
-
-```json
-{
-  "vocab_size": 32000,
-  "embedding_dim": 768,
-  "d_model": 512,
-  "n_heads": 8,
-  "d_ff": 2048,
-  "n_encoder_layers": 6,
-  "n_decoder_layers": 6,
-  "pad_token_id": 0,
-  "bos_token_id": 1,
-  "eos_token_id": 2,
-  "plh_token_id": 3
-}
-```
-
-`train_config.json` owns data, Hugging Face embedding import, policy,
-optimizer, scheduler, runtime, and checkpoint settings. It is also strict.
-See the root example for all supported keys.
-
-Hugging Face integration calls only:
+### Inference
 
 ```python
-transformers.AutoModel.from_pretrained(...).get_input_embeddings()
+import torch
+from transformers import AutoTokenizer
+from huggingface_hub import hf_hub_download
+from levt import LevTConfig, LevTModel, GreedyDecoder
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(
+    'openbmb/MiniCPM4-0.5B', trust_remote_code=True
+)
+
+# Load model
+config = LevTConfig.from_json(
+    hf_hub_download('KrisTHL181/LevT-Nekoizer', 'config.json')
+)
+model = LevTModel(config)
+state_dict = torch.load(
+    hf_hub_download('KrisTHL181/LevT-Nekoizer', 'pytorch_model.bin'),
+    map_location='cpu', weights_only=True
+)
+model.load_state_dict(state_dict)
+model.eval()
+
+# Encode → refine → decode
+decoder = GreedyDecoder(model, config)
+src_ids = tokenizer.encode('把全知乎都变成猫娘！', add_special_tokens=False)
+output, iterations = decoder.decode(torch.tensor(src_ids))
+print(tokenizer.decode(output.tolist(), skip_special_tokens=True))
 ```
 
-It never loads `AutoTokenizer`. `torch_dtype` controls the temporary Hugging
-Face model load. The imported table must exactly match
-`(vocab_size, embedding_dim)`. The LevT model is initialized first, then the
-external weights are copied, so copied weights are not reinitialized.
+An interactive REPL is also available:
 
-## Training
+```bash
+python preview.py \
+  --config config.json \
+  --checkpoint pytorch_model.bin \
+  --tokenizer openbmb/MiniCPM4-0.5B \
+  --interactive
+```
 
-Install PyTorch, Transformers, and pytest in the environment, then run:
+## How It Works
+
+LevT refines text in iterative edit passes. Each iteration runs three
+classifier heads:
+
+| Phase | What it does |
+|---|---|
+| **Delete** | Marks every token as keep or delete |
+| **Placeholder** | Predicts how many new tokens to insert between each pair |
+| **Fill** | Replaces each placeholder with an actual vocabulary token |
+
+The model repeats until the sequence stabilizes (or hits `max_iterations`).
+Because insertions and deletions can change sequence length, LevT isn't bound
+by a fixed output length — it can freely restructure sentences.
+
+### Architecture
+
+This implementation modernizes the original 2019 LevT with techniques from
+contemporary decoder-only LLMs:
+
+| Component | Original Paper | This Implementation |
+|---|---|---|
+| Position encoding | Learned absolute / sinusoidal | **ALiBi** — linear bias, strong length extrapolation |
+| Normalization | Post-LayerNorm | **Pre-RMSNorm** — stable gradient flow, cheaper compute |
+| FFN activation | ReLU | **GELU** — smooth, non-monotonic, no dead neurons |
+| Optimizer | Adam | **Muon** for linear layers, **AdamW** for everything else |
+| Attention | Standard SDPA | **SDPA + QK Norm** — prevents entropy collapse, stabilizes training |
+| Embeddings | Random init | **MiniCPM4-0.5B** pretrained embeddings, projected 1024 → 512 |
+
+The token head shares weights with the input embedding matrix (no separate
+output projection), and the 512↔1024 projection layer is reused via transpose
+for the output logits.
+
+### Training
+
+Trained with **dual-policy learning**: the insertion and deletion policies are
+trained alternately, each learning to fix the other's imperfect output. Oracle
+edit paths are computed via Levenshtein DP (insertion + deletion only, no
+substitution) using longest-common-subsequence alignment.
+
+| Stat | Value |
+|---|---|
+| Training samples | 207,151 (from 7,726 Zhihu answers) |
+| Vocabulary | 73,448 (Chinese + English tokens) |
+| Embedding dim | 1024 (projected → 512) |
+| Model dim | 512 |
+| Attention heads | 8 |
+| Encoder / Decoder layers | 6 / 6 |
+| Training steps | 300,000 |
+| Optimizer | Muon (lr 0.02) + AdamW (lr 0.001), warmup + linear decay |
+
+### Why not an LLM?
+
+A browser-hosted LLM (~6 GB resident, per-tab) is untenable for rewriting every
+Zhihu answer on page load. A 60–220M parameter seq2seq model is the right
+weight class — and among those, LevT's iterative-edit approach is far more
+sample-efficient than one-shot generation for tasks where most of the input
+stays intact.
+
+## Train Your Own
 
 ```bash
 python train.py --model-config config.json --train-config train_config.json
 ```
 
-Resume from a checkpoint with:
+Data format (JSONL):
 
-```bash
-python train.py --model-config config.json --train-config train_config.json \
-  --resume checkpoints/latest.pt
+```json
+{"src": [4, 5, 6], "target": [1, 9, 10, 2], "initial": [1, 2]}
 ```
 
-Training is single-process on one CPU or one GPU. DataLoader batching is by
-example count. For each batch, CPU oracle construction produces three independently padded
-target batches (`y_ins`, `y_ins_plh`, `y_del`). `PreparedBatch` fixes these
-stochastic roll-ins once. The public `prepare_batch()` and
-`loss_sums_and_counts()` APIs expose differentiable per-head loss sums plus
-valid-label counts. Gradient accumulation normalizes each head by its exact
-count over the whole optimizer window, backpropagating one prepared microbatch
-at a time without retaining graphs. Validation uses the same per-head
-sum/count reduction over the complete loader, so its result is independent of
-batch partitioning. Placeholder and token losses use label smoothing; deletion
-does not. `-100` marks padded loss targets.
+- `src` and `target` are required; `initial` defaults to `[BOS, EOS]`
+- Values are pre-tokenized integer ID lists — no tokenizer is bundled
 
-CUDA FP16 uses GradScaler. CUDA BF16 and CPU BF16 use autocast without scaling.
-Set `amp_dtype` to `none` for full precision. Checkpoints include model,
-optimizer, scheduler, scaler, global step, epoch plus the next-batch resume
-cursor, strict configs, and Python, Torch, and CUDA RNG state where available.
-Shuffle order is deterministic per epoch, so optimizer-boundary checkpoints
-resume without replaying prior batches. Both `latest.pt` and numbered step
-checkpoints are written atomically.
+See `config.json` and `train_config.json` for all model and training knobs.
 
-The Python API retains single-example use:
-
-```python
-loss, metrics = DualPolicyTrainer(model, model_config).train_step(src, initial, target)
-loss.backward()
-```
-
-For real training, pass the batch dictionary produced by `LevTCollator`.
-
-## Inference
-
-```python
-import torch
-from levt import GreedyDecoder, LevTConfig, LevTModel
-
-config = LevTConfig(vocab_size=32000)
-model = LevTModel(config)
-decoder = GreedyDecoder(model, config)
-output, iterations = decoder.decode(torch.tensor([4, 5, 6]))
-```
-
-The encoder memory is computed once and reused across refinement iterations.
-Each phase requests only its required classifier head; token logits are computed
-only at placeholder positions. PAD, BOS, EOS, and PLH IDs are masked from fill
-predictions. `decode()` temporarily uses evaluation mode and restores the
-model's prior training state. Boundary tokens are never deleted. Decoding stops
-on convergence, a direct loop, or `max_iterations`.
-
-Sinusoidal and RoPE tables are runtime caches and are omitted from checkpoints.
-Sinusoidal encoding supports odd model dimensions; RoPE caches refresh for the
-active device and dtype.
-
-## Verification
+## Tests
 
 ```bash
 PYTHONPATH=. pytest -q tests
 python -m py_compile train.py levt/*.py tests/*.py
 ```
+
+## Citation
+
+```bibtex
+@inproceedings{gu2019levenshtein,
+  title={Levenshtein Transformer},
+  author={Gu, Jiatao and Wang, Changhan and Zhao, Junbo},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2019}
+}
+```
+
+## License
+
+MIT
