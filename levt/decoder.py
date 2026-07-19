@@ -58,12 +58,35 @@ class GreedyDecoder:
         finally:
             self.model.train(was_training)
 
+    @torch.no_grad()
+    def decode_with_trace(
+        self,
+        src_tokens: torch.Tensor,
+        y0: Optional[torch.Tensor] = None,
+        src_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, int, list]:
+        """Like :meth:`decode` but also returns a step-by-step trace.
+
+        Returns:
+            output, num_iterations, trace
+
+        ``trace`` is a list of ``(phase_label, token_tensor)`` tuples where
+        ``phase_label`` is one of ``"start"``, ``"del"``, ``"plh"``, ``"fill"``.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return self._decode(src_tokens, y0, src_padding_mask, return_trace=True)
+        finally:
+            self.model.train(was_training)
+
     def _decode(
         self,
         src_tokens: torch.Tensor,
         y0: Optional[torch.Tensor] = None,
         src_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, int]:
+        return_trace: bool = False,
+    ) -> Tuple[torch.Tensor, int] | Tuple[torch.Tensor, int, list]:
         """
         Decode one sequence.
 
@@ -71,10 +94,13 @@ class GreedyDecoder:
             src_tokens:       (src_len,) source tokens
             y0:               (L0,) initial target tokens. Default: [BOS, EOS]
             src_padding_mask: (src_len,) or None
+            return_trace:     if True, also return a step-by-step trace
 
         Returns:
             output:           final token sequence
             num_iterations:   number of refinement iterations taken
+            trace:            (only if ``return_trace=True``) list of
+                              ``(phase, token_tensor)`` tuples
         """
         if y0 is None:
             y0 = torch.tensor(
@@ -92,6 +118,9 @@ class GreedyDecoder:
         y = y0
         prev_y = None
         iteration = 0
+        trace: list = []
+        if return_trace:
+            trace.append(("start", y.clone()))
 
         while iteration < self.cfg.max_iterations:
             # ---- Phase 1: Deletion ----
@@ -100,6 +129,9 @@ class GreedyDecoder:
                 y_after_del = self._delete_tokens(memory, y, src_mask)
             else:
                 y_after_del = y  # skip deletion for empty sequence
+
+            if return_trace:
+                trace.append(("del", y_after_del.clone()))
 
             # ---- Termination: loop detection ----
             if iteration > 0 and prev_y is not None:
@@ -111,6 +143,9 @@ class GreedyDecoder:
             # ---- Phase 2: Insert placeholders ----
             y_with_plh = self._insert_placeholders(memory, y_after_del, src_mask)
 
+            if return_trace:
+                trace.append(("plh", y_with_plh.clone()))
+
             # ---- Termination: nothing changed ----
             if torch.equal(y_with_plh, y_after_del) and torch.equal(y_with_plh, y):
                 break
@@ -121,8 +156,13 @@ class GreedyDecoder:
             else:
                 y = self._fill_tokens(memory, y_with_plh, src_mask)
 
+            if return_trace:
+                trace.append(("fill", y.clone()))
+
             iteration += 1
 
+        if return_trace:
+            return y, iteration, trace
         return y, iteration
 
     # ------------------------------------------------------------------
