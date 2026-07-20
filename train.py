@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
         "--resume-csv", default=None,
         help="append to this CSV progress file instead of overwriting it",
     )
+    parser.add_argument(
+        "--bypass-config-check", action="store_true",
+        help="skip config mismatch check when resuming from checkpoint",
+    )
     return parser.parse_args()
 
 
@@ -302,14 +306,14 @@ def main() -> None:
     checkpoint: Optional[Dict[str, Any]] = None
     if resume_path:
         checkpoint = load_checkpoint(resume_path, map_location="cpu")
-        if checkpoint["model_config"] != model_cfg.to_dict():
+        if not args.bypass_config_check and checkpoint["model_config"] != model_cfg.to_dict():
             raise ValueError("checkpoint model configuration does not match config.json")
         saved_train_config = checkpoint.get("train_config")
         current_train_config = train_cfg.to_dict()
         if isinstance(saved_train_config, dict):
             saved_train_config = {**saved_train_config, "resume_from": None}
             current_train_config = {**current_train_config, "resume_from": None}
-        if saved_train_config != current_train_config:
+        if not args.bypass_config_check and saved_train_config != current_train_config:
             diffs: list[str] = []
             if isinstance(saved_train_config, dict) and isinstance(current_train_config, dict):
                 all_keys = set(saved_train_config.keys()) | set(current_train_config.keys())
