@@ -311,12 +311,15 @@ def main() -> None:
             current_train_config = {**current_train_config, "resume_from": None}
         if saved_train_config != current_train_config:
             diffs: list[str] = []
-            all_keys = set(saved_train_config.keys()) | set(current_train_config.keys())
-            for key in sorted(all_keys):
-                sv = saved_train_config.get(key)
-                cv = current_train_config.get(key)
-                if sv != cv:
-                    diffs.append(f"  {key}: checkpoint={sv!r}, config.json={cv!r}")
+            if isinstance(saved_train_config, dict) and isinstance(current_train_config, dict):
+                all_keys = set(saved_train_config.keys()) | set(current_train_config.keys())
+                for key in sorted(all_keys):
+                    sv = saved_train_config.get(key)
+                    cv = current_train_config.get(key)
+                    if sv != cv:
+                        diffs.append(f"  {key}: checkpoint={sv!r}, train_config.json={cv!r}")
+            else:
+                diffs.append(f"  checkpoint={saved_train_config!r}, train_config.json={current_train_config!r}")
             raise ValueError(
                 "checkpoint training configuration does not match train_config.json:\n"
                 + "\n".join(diffs)
