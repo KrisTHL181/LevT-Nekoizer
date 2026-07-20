@@ -382,6 +382,7 @@ def main() -> None:
 
     # --- Rich progress display -------------------------------------------
     display = None
+    _display_total_set = False
     if HAS_RICH:
         display = TrainingDisplay(train_cfg.max_training_steps)
 
@@ -412,21 +413,34 @@ def main() -> None:
             shuffle=True,
             shuffle_seed=train_cfg.seed + epoch,
         )
-        if resume_batch_index > len(train_loader):
-            raise ValueError("checkpoint batch position exceeds the epoch length")
-        if display is not None and epoch == start_epoch:
+        if resume_batch_index >= len(train_loader):
+            # batch_size (or the dataset) may have changed since the
+            # checkpoint was saved; the stored batch position no longer
+            # fits within this epoch.  Advance to the next epoch instead
+            # of raising an error — the data those batches covered has
+            # already been processed.
+            print(
+                f"checkpoint batch position {resume_batch_index} >= epoch "
+                f"length {len(train_loader)} — batch_size or dataset may "
+                f"have changed since the checkpoint; advancing to next epoch",
+                flush=True,
+            )
+            resume_batch_index = 0
+            continue
+        if display is not None and not _display_total_set:
             # Compute the real training ceiling: max_training_steps _or_
             # epoch exhaustion — whichever comes first.  The progress bar
             # then shows "how far through what we'll actually run."
             steps_per_epoch = math.ceil(
                 len(train_loader) / train_cfg.gradient_accumulation_steps
             )
-            remaining_epochs = train_cfg.epochs - start_epoch
+            remaining_epochs = train_cfg.epochs - epoch
             actual_total = min(
                 train_cfg.max_training_steps,
                 remaining_epochs * steps_per_epoch,
             )
             display.set_total(actual_total)
+            _display_total_set = True
         train_iterator = iter(enumerate(train_loader))
         for batch_index, batch in train_iterator:
             if global_step >= train_cfg.max_training_steps:
