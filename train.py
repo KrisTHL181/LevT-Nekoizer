@@ -310,7 +310,17 @@ def main() -> None:
             saved_train_config = {**saved_train_config, "resume_from": None}
             current_train_config = {**current_train_config, "resume_from": None}
         if saved_train_config != current_train_config:
-            raise ValueError("checkpoint training configuration does not match train_config.json")
+            diffs: list[str] = []
+            all_keys = set(saved_train_config.keys()) | set(current_train_config.keys())
+            for key in sorted(all_keys):
+                sv = saved_train_config.get(key)
+                cv = current_train_config.get(key)
+                if sv != cv:
+                    diffs.append(f"  {key}: checkpoint={sv!r}, config.json={cv!r}")
+            raise ValueError(
+                "checkpoint training configuration does not match train_config.json:\n"
+                + "\n".join(diffs)
+            )
         model.load_state_dict(checkpoint["model"])
     else:
         import_hf_embeddings(
