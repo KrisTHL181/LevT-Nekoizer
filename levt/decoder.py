@@ -70,8 +70,10 @@ class GreedyDecoder:
         Returns:
             output, num_iterations, trace
 
-        ``trace`` is a list of ``(phase_label, token_tensor)`` tuples where
-        ``phase_label`` is one of ``"start"``, ``"del"``, ``"plh"``, ``"fill"``.
+        ``trace`` is a list of ``(phase_label, token_tensor, entropy)`` tuples
+        where ``phase_label`` is one of ``"start"``, ``"del"``, ``"plh"``,
+        ``"fill"`` and ``entropy`` is the average per-decision entropy in nats
+        (``None`` for ``"start"`` and skipped phases).
         """
         was_training = self.model.training
         self.model.eval()
@@ -94,13 +96,14 @@ class GreedyDecoder:
             src_tokens:       (src_len,) source tokens
             y0:               (L0,) initial target tokens. Default: [BOS, EOS]
             src_padding_mask: (src_len,) or None
-            return_trace:     if True, also return a step-by-step trace
+            return_trace:     if True, also return a step-by-step trace with
+                              per-phase average entropies
 
         Returns:
             output:           final token sequence
             num_iterations:   number of refinement iterations taken
             trace:            (only if ``return_trace=True``) list of
-                              ``(phase, token_tensor)`` tuples
+                              ``(phase, token_tensor, entropy)`` tuples
         """
         if y0 is None:
             y0 = torch.tensor(
@@ -120,18 +123,22 @@ class GreedyDecoder:
         iteration = 0
         trace: list = []
         if return_trace:
-            trace.append(("start", y.clone()))
+            trace.append(("start", y.clone(), None))
 
         while iteration < self.cfg.max_iterations:
             # ---- Phase 1: Deletion ----
             is_empty = len(y) <= 2 and y[0].item() == self.cfg.bos_token_id and y[-1].item() == self.cfg.eos_token_id
+            del_ent = None
             if not is_empty:
-                y_after_del = self._delete_tokens(memory, y, src_mask)
+                if return_trace:
+                    y_after_del, del_ent = self._delete_tokens(memory, y, src_mask, return_entropy=True)
+                else:
+                    y_after_del = self._delete_tokens(memory, y, src_mask)
             else:
                 y_after_del = y  # skip deletion for empty sequence
 
             if return_trace:
-                trace.append(("del", y_after_del.clone()))
+                trace.append(("del", y_after_del.clone(), del_ent))
 
             # ---- Termination: loop detection ----
             if iteration > 0 and prev_y is not None:
@@ -141,23 +148,31 @@ class GreedyDecoder:
             prev_y = y_after_del.clone()
 
             # ---- Phase 2: Insert placeholders ----
-            y_with_plh = self._insert_placeholders(memory, y_after_del, src_mask)
+            plh_ent = None
+            if return_trace:
+                y_with_plh, plh_ent = self._insert_placeholders(memory, y_after_del, src_mask, return_entropy=True)
+            else:
+                y_with_plh = self._insert_placeholders(memory, y_after_del, src_mask)
 
             if return_trace:
-                trace.append(("plh", y_with_plh.clone()))
+                trace.append(("plh", y_with_plh.clone(), plh_ent))
 
             # ---- Termination: nothing changed ----
             if torch.equal(y_with_plh, y_after_del) and torch.equal(y_with_plh, y):
                 break
 
             # ---- Phase 3: Fill placeholders ----
+            fill_ent = None
             if torch.equal(y_with_plh, y_after_del):
                 y = y_with_plh  # nothing inserted, skip fill
             else:
-                y = self._fill_tokens(memory, y_with_plh, src_mask)
+                if return_trace:
+                    y, fill_ent = self._fill_tokens(memory, y_with_plh, src_mask, return_entropy=True)
+                else:
+                    y = self._fill_tokens(memory, y_with_plh, src_mask)
 
             if return_trace:
-                trace.append(("fill", y.clone()))
+                trace.append(("fill", y.clone(), fill_ent))
 
             iteration += 1
 
@@ -217,6 +232,23 @@ class GreedyDecoder:
         return torch.multinomial(probs, num_samples=1).squeeze(dim)
 
     # ------------------------------------------------------------------
+    # Entropy helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _entropy_from_logits(logits: torch.Tensor) -> float:
+        """Average per-decision entropy (nats) over the last dimension.
+
+        Returns 0.0 for empty tensors.
+        """
+        if logits.numel() == 0:
+            return 0.0
+        log_probs = torch.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy = -(probs * log_probs).sum(dim=-1)
+        return entropy.mean().item()
+
+    # ------------------------------------------------------------------
     # Phase implementations
     # ------------------------------------------------------------------
 
@@ -225,7 +257,8 @@ class GreedyDecoder:
         memory: torch.Tensor,
         y: torch.Tensor,
         src_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_entropy: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, float]:
         """Apply deletion policy: sample / argmax π^del → keep only tokens predicted as 'keep'."""
         y_t = y.unsqueeze(1)  # (T, 1)
         tgt_mask = torch.zeros(1, len(y), dtype=torch.bool, device=y.device)
@@ -244,14 +277,18 @@ class GreedyDecoder:
         del_preds[0] = False
         del_preds[-1] = False
 
-        return y[~del_preds]
+        result = y[~del_preds]
+        if return_entropy:
+            return result, self._entropy_from_logits(del_logits)
+        return result
 
     def _insert_placeholders(
         self,
         memory: torch.Tensor,
         y: torch.Tensor,
         src_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_entropy: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, float]:
         """Apply placeholder policy: sample / argmax π^plh → insert <PLH> tokens."""
         y_t = y.unsqueeze(1)
         tgt_mask = torch.zeros(1, len(y), dtype=torch.bool, device=y.device)
@@ -279,14 +316,18 @@ class GreedyDecoder:
                 for _ in range(min(count, self.cfg.max_placeholder)):
                     result.append(self.cfg.plh_token_id)
 
-        return torch.tensor(result, dtype=y.dtype, device=y.device)
+        result_tensor = torch.tensor(result, dtype=y.dtype, device=y.device)
+        if return_entropy:
+            return result_tensor, self._entropy_from_logits(plh_logits)
+        return result_tensor
 
     def _fill_tokens(
         self,
         memory: torch.Tensor,
         y_with_plh: torch.Tensor,
         src_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_entropy: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, float]:
         """Apply token policy: sample / argmax π^tok → replace <PLH> with predicted tokens."""
         y_t = y_with_plh.unsqueeze(1)
         tgt_mask = torch.zeros(1, len(y_with_plh), dtype=torch.bool, device=y_with_plh.device)
@@ -298,6 +339,12 @@ class GreedyDecoder:
             token_positions=placeholder_positions,
         )
         tok_logits = out["tok_logits"]  # (num_placeholders, V)
+
+        # Compute entropy before masking reserved tokens — masking produces
+        # -inf logits which cause NaN in the entropy calculation.
+        if return_entropy:
+            fill_entropy = self._entropy_from_logits(tok_logits)
+
         reserved = {
             self.cfg.pad_token_id, self.cfg.bos_token_id,
             self.cfg.eos_token_id, self.cfg.plh_token_id,
@@ -307,4 +354,6 @@ class GreedyDecoder:
 
         result = y_with_plh.clone()
         result[result.eq(self.cfg.plh_token_id)] = tok_preds
+        if return_entropy:
+            return result, fill_entropy
         return result

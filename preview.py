@@ -168,7 +168,7 @@ def _divider(char: str = "─", width: int = 80) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _render_trace(
-    trace: List[Tuple[str, torch.Tensor]],
+    trace: List[Tuple[str, torch.Tensor, float | None]],
     tokenizer,
     config: LevTConfig,
 ) -> str:
@@ -217,7 +217,7 @@ def _render_trace(
         for _ in range(3):  # up to 3 phases per iteration
             if i >= len(phases):
                 break
-            phase_name, tokens = phases[i]
+            phase_name, tokens, entropy = phases[i]
             i += 1
 
             labels = _labels(tokens)
@@ -235,7 +235,8 @@ def _render_trace(
                 prev.tolist(), tokens.tolist(), labels, config, phase_name,
             )
 
-            lines.append(f"    {phase_colour}{phase_name:>4}{_RESET}  {token_line}")
+            entropy_str = f"  {_DIM}[H={entropy:.3f}]{_RESET}" if entropy is not None else ""
+            lines.append(f"    {phase_colour}{phase_name:>4}{_RESET}  {token_line}{entropy_str}")
             if annotations:
                 lines.append(f"          {', '.join(annotations)}")
 
@@ -341,10 +342,14 @@ def _safe_strip(s: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _print_sample(index: int, source_text: str, target_text: str,
-                  predicted_text: str, iterations: int) -> None:
+                  predicted_text: str, iterations: int,
+                  avg_entropy: float | None = None) -> None:
     """Pretty-print one sample with source, target, and prediction."""
     print(_divider())
-    print(f"  Sample #{index + 1}  (decoding iterations: {iterations})")
+    header = f"  Sample #{index + 1}  (decoding iterations: {iterations})"
+    if avg_entropy is not None:
+        header += f"  avg H = {avg_entropy:.3f} nats"
+    print(header)
     print(_divider())
     print(f"  Source:     {source_text}")
     print(f"  Target:     {target_text}")
@@ -358,18 +363,22 @@ def preview_sample(
     row: dict,
     device: torch.device,
     tokenizer,
-) -> Tuple[str, str, str, int]:
-    """Run decoding on one sample and return (source, target, predicted, iters)."""
+) -> Tuple[str, str, str, int, float | None]:
+    """Run decoding on one sample and return (source, target, predicted, iters, avg_entropy)."""
     src_tokens = torch.tensor(row["src"], dtype=torch.long, device=device)
     initial = torch.tensor(row["initial"], dtype=torch.long, device=device)
 
-    output, iterations = decoder.decode(src_tokens, initial)
+    output, iterations, trace = decoder.decode_with_trace(src_tokens, initial)
 
     source_text = _tokens_to_text(row["src"], tokenizer, config)
     target_text = _tokens_to_text(row["target"], tokenizer, config)
     predicted_text = _tokens_to_text(output.tolist(), tokenizer, config)
 
-    return source_text, target_text, predicted_text, iterations
+    # Average entropy across all phases that have entropy values.
+    entropies = [ent for _, _, ent in trace if ent is not None]
+    avg_entropy = sum(entropies) / len(entropies) if entropies else None
+
+    return source_text, target_text, predicted_text, iterations, avg_entropy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -444,8 +453,13 @@ def _interactive_loop(
             if show_trace:
                 output, iterations, trace = decoder.decode_with_trace(src_tensor)
                 rendered = _render_trace(trace, tokenizer, config)
+                entropies = [ent for _, _, ent in trace if ent is not None]
+                avg_h = sum(entropies) / len(entropies) if entropies else None
                 print(f"\n{rendered}\n")
-                print(f"  {_DIM}({iterations} iteration{'s' if iterations != 1 else ''}){_RESET}")
+                parts = [f"{_DIM}{iterations} iteration{'s' if iterations != 1 else ''}{_RESET}"]
+                if avg_h is not None:
+                    parts.append(f"{_DIM}avg H = {avg_h:.3f} nats{_RESET}")
+                print(f"  {', '.join(parts)}")
             else:
                 output, iterations = decoder.decode(src_tensor)
                 final_text = _tokens_to_text(output.tolist(), tokenizer, config)
@@ -628,13 +642,13 @@ Examples:
         for i, idx in enumerate(indices):
             row = dataset[idx]
             try:
-                src_text, tgt_text, pred_text, iters = preview_sample(
+                src_text, tgt_text, pred_text, iters, avg_ent = preview_sample(
                     decoder, model_cfg, row, device, tokenizer,
                 )
             except Exception as exc:
                 print(f"  !! Sample #{i + 1} (row {idx}) failed: {exc}")
                 continue
-            _print_sample(i, src_text, tgt_text, pred_text, iters)
+            _print_sample(i, src_text, tgt_text, pred_text, iters, avg_ent)
 
     print(_divider("═"))
     print("  Done.")
