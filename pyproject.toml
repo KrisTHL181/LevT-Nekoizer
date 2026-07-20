@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "levt-nekoizer"
+version = "0.1.0"
+description = "Levenshtein Transformer for iterative text refinement — turns Zhihu prose into catgirl-speak"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "KrisTHL181" },
+]
+keywords = [
+    "levenshtein-transformer",
+    "text-refinement",
+    "non-autoregressive",
+    "sequence-editing",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/KrisTHL181/LevT-Nekoizer"
+Repository = "https://github.com/KrisTHL181/LevT-Nekoizer"
+"HF Hub" = "https://huggingface.co/KrisTHL181/LevT-Nekoizer"
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "rich>=13",
+]
+inference = [
+    "torch>=2.0",
+    "transformers>=4.30",
+]
+viz = [
+    "plotly>=5",
+    "pandas>=2",
+]
+test = [
+    "pytest>=7",
+]
+dev = [
+    "levt-nekoizer[train,test,viz]",
+]
+
+[tool.setuptools]
+packages = ["levt"]
+
+[tool.setuptools.package-data]
+levt = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
