@@ -328,7 +328,6 @@ def main() -> None:
                 "checkpoint training configuration does not match train_config.json:\n"
                 + "\n".join(diffs)
             )
-        model.load_state_dict(checkpoint["model"])
     else:
         import_hf_embeddings(
             model,
@@ -342,6 +341,9 @@ def main() -> None:
 
     prealloc_model_grads(model)
     model = torch.compile(model, fullgraph=True)
+
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model"])
 
     trainer = DualPolicyTrainer(model, model_cfg, train_cfg.policy)
     adamw, muon = build_optimizers(model, train_cfg)
