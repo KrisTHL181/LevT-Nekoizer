@@ -19,6 +19,8 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
 
 _module: Any = None
 _load_attempted = False
@@ -73,10 +75,12 @@ def _get_module() -> Any:
 
 
 def levenshtein_align_cpp(
-    y: list[int], y_star: list[int],
-) -> tuple[list[int], list[list[int]]] | None:
+    y: torch.Tensor, y_star: torch.Tensor,
+) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
     """
     C++ accelerated Levenshtein alignment.
+
+    Accepts PyTorch tensors directly — no Python list serialization.
 
     Returns ``None`` if the extension is unavailable (caller should fall back
     to the pure-Python implementation).
@@ -127,9 +131,11 @@ def verify_cpp_extension() -> CppExtensionStatus:
     if mod is None:
         return _diagnose_failure()
 
-    # ── 3. Smoke test: run a real alignment ────────────────────────────
+    # ── 3. Smoke test: run a real alignment (tensors, not lists) ───────
     try:
-        result = mod.levenshtein_align([1, 2], [1, 3, 4, 2])
+        y = torch.tensor([1, 2], dtype=torch.long)
+        y_star = torch.tensor([1, 3, 4, 2], dtype=torch.long)
+        result = mod.levenshtein_align(y, y_star)
     except Exception as exc:
         return CppExtensionStatus(
             available=False,
@@ -146,11 +152,17 @@ def verify_cpp_extension() -> CppExtensionStatus:
                      "rm -rf ~/.cache/torch_extensions",
         )
 
-    expected = ([], [[3, 4]])
-    if result != expected:
+    deletions, per_gap = result
+    expected_deletions = torch.tensor([], dtype=torch.long)
+    expected_per_gap = [torch.tensor([3, 4], dtype=torch.long)]
+
+    if not torch.equal(deletions, expected_deletions) or \
+       len(per_gap) != len(expected_per_gap) or \
+       not torch.equal(per_gap[0], expected_per_gap[0]):
         return CppExtensionStatus(
             available=False,
-            error=f"Smoke test produced wrong result: {result} != {expected}",
+            error=f"Smoke test produced wrong result: {result} != "
+                  f"({expected_deletions}, {expected_per_gap})",
             fix_hint="The cached .so may be from a different source version. "
                      "Remove ~/.cache/torch_extensions and re-run.",
         )

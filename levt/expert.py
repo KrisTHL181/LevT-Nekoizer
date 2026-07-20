@@ -34,7 +34,7 @@ def levenshtein_align(
     y: torch.Tensor,
     y_star: torch.Tensor,
     pad_idx: int = 0,
-) -> Tuple[List[int], List[List[int]]]:
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     """
     Compute optimal edit alignment between two sequences using DP.
 
@@ -49,21 +49,23 @@ def levenshtein_align(
         pad_idx: padding token id (ignored)
 
     Returns:
-        deletions:  list of indices in y to delete (0-indexed, excluding boundaries)
-        insertions: list-of-lists, insertions[i] = tokens to insert between
-                    y_pos[i] and y_pos[i+1] in the *surviving* sequence
-                    (i.e., after deletions are removed)
+        deletions:  1-D int64 tensor — indices in y to delete
+        insertions: list of 1-D int64 tensors — per-gap insertion tokens
 
-    NOTE: Boundary tokens (first and last) are never deleted.
+    NOTE: Boundary tokens (first and last) are never deleted by the callers.
     """
-    # ── Fast path: C++ extension ────────────────────────────────────
+    # ── Fast path: C++ extension (tensors in, tensors out) ────────────
     if levenshtein_align_cpp is not None:
-        result = levenshtein_align_cpp(y.tolist(), y_star.tolist())
+        result = levenshtein_align_cpp(y, y_star)
         if result is not None:
             return result
 
     # ── Fallback: pure Python DP ────────────────────────────────────
-    return _levenshtein_align_py(y, y_star)
+    del_list, ins_lists = _levenshtein_align_py(y, y_star)
+    # Convert to tensors for uniform interface
+    del_tensor = torch.tensor(del_list, dtype=torch.long)
+    ins_tensors = [torch.tensor(ins, dtype=torch.long) for ins in ins_lists]
+    return del_tensor, ins_tensors
 
 
 def _levenshtein_align_py(
@@ -200,8 +202,8 @@ def oracle_deletion(
     """
     deletions, _ = levenshtein_align(y, y_star)
     mask = torch.zeros(len(y), dtype=torch.bool)
-    for d in deletions:
-        mask[d] = True
+    if deletions.numel() > 0:
+        mask[deletions] = True  # fancy indexing — O(num_deletions)
     # Never delete boundaries
     mask[0] = False
     mask[-1] = False
@@ -229,30 +231,26 @@ def oracle_insertion(
     """
     deletions, insertions = levenshtein_align(y, y_star)
 
-    # Build surviving sequence (tokens NOT deleted)
-    del_set = set(deletions)
-    surviving = [idx for idx in range(len(y)) if idx not in del_set]
+    # Build surviving mask (tokens NOT deleted)
+    del_mask = torch.zeros(len(y), dtype=torch.bool)
+    if deletions.numel() > 0:
+        del_mask[deletions] = True
+    surviving = torch.where(~del_mask)[0]  # (num_surviving,)
 
     num_gaps = max(0, len(surviving) - 1)
 
-    # placeholder counts for EACH gap in the ORIGINAL y (len(y)-1 gaps)
-    # But we need them for the surviving sequence gaps.
-    # The paper uses y_ins which already has deletions applied (from oracle
-    # or random), so the gaps are between adjacent surviving tokens.
+    # Placeholder counts for each gap in the ORIGINAL y (len(y)-1 gaps).
+    # Insertion counts are assigned to the gap anchored at each surviving token.
     p_star = torch.zeros(len(y) - 1, dtype=torch.long)
     t_star_parts: List[torch.Tensor] = []
 
-    # Map gap index in surviving sequence to gap index in original y
     for gi in range(num_gaps):
-        left_orig = surviving[gi]
-        right_orig = surviving[gi + 1]
-        # The gap in original y spans from left_orig to right_orig-1
-        # We assign the insertion count to the gap at position left_orig
-        tokens_to_insert = insertions[gi] if gi < len(insertions) else []
-        count = min(len(tokens_to_insert), max_placeholder)
+        left_orig = int(surviving[gi].item())
+        tokens_to_insert = insertions[gi]  # 1-D tensor (may be empty)
+        count = min(tokens_to_insert.numel(), max_placeholder)
         p_star[left_orig] = count
         if count > 0:
-            t_star_parts.append(torch.tensor(tokens_to_insert[:count], dtype=torch.long))
+            t_star_parts.append(tokens_to_insert[:count])
 
     if t_star_parts:
         t_star = torch.cat(t_star_parts)
