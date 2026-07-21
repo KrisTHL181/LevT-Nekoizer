@@ -134,6 +134,9 @@ def make_loader(
         generator=generator,
         num_workers=train_cfg.num_workers,
         collate_fn=collator,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        pin_memory=True,
+        prefetch_factor=4,
     )
     if len(loader) == 0:
         raise ValueError(f"data loader for {path} has zero batches")
