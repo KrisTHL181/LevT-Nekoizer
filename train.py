@@ -232,6 +232,7 @@ def checkpoint_payload(
     global_step: int,
     epoch: int,
     next_batch_index: int,
+    checkpoint_val_loss: Dict[int, float],
 ) -> Dict[str, Any]:
     return {
         "model": model.state_dict(),
@@ -250,6 +251,7 @@ def checkpoint_payload(
         "epoch": epoch,
         "next_batch_index": next_batch_index,
         "rng_state": capture_rng_state(),
+        "checkpoint_val_loss": checkpoint_val_loss,
     }
 
 
@@ -362,6 +364,7 @@ def main() -> None:
     global_step = 0
     start_epoch = 0
     next_batch_index = 0
+    checkpoint_val_loss: Dict[int, float] = {}
     if checkpoint is not None:
         adamw.load_state_dict(checkpoint["optimizer"]["adamw"])
         muon.load_state_dict(checkpoint["optimizer"]["muon"])
@@ -372,6 +375,7 @@ def main() -> None:
         start_epoch = int(checkpoint["epoch"])
         next_batch_index = int(checkpoint.get("next_batch_index", 0))
         restore_rng_state(checkpoint["rng_state"])
+        checkpoint_val_loss = checkpoint.get("checkpoint_val_loss", {})
 
     checkpoint_dir = Path(train_cfg.checkpoint_dir)
     adamw.zero_grad(set_to_none=True)
@@ -383,7 +387,6 @@ def main() -> None:
     best_val_step: Optional[int] = None
     steps_since_improvement = 0
     current_val_loss: Optional[float] = None
-    checkpoint_val_loss: Dict[int, float] = {}
 
     # --- Rich progress display -------------------------------------------
     display = None
@@ -583,6 +586,7 @@ def main() -> None:
                         global_step=global_step,
                         epoch=next_epoch,
                         next_batch_index=next_index,
+                        checkpoint_val_loss=checkpoint_val_loss,
                     ),
                 )
                 if current_val_loss is not None:
@@ -604,6 +608,7 @@ def main() -> None:
         global_step=global_step,
         epoch=final_epoch,
         next_batch_index=final_batch_index,
+        checkpoint_val_loss=checkpoint_val_loss,
     )
     if display is not None:
         display.close()
