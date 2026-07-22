@@ -8,6 +8,7 @@ import contextlib
 import csv
 import math
 import random
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -233,6 +234,41 @@ def build_optimizers(
     return adamw, muon
 
 
+def _apply_train_config_to_optimizers(
+    adamw: AdamW,
+    muon: Muon,
+    adamw_scheduler: LambdaLR,
+    muon_scheduler: LambdaLR,
+    train_cfg: TrainConfig,
+) -> None:
+    """Re-apply current ``TrainConfig`` hyperparameters to optimizer param groups.
+
+    After ``load_state_dict`` restores checkpoint-stored hyperparameters, this
+    call overrides them with the values from the current ``train_config.json``
+    so that changed LR, weight decay, betas, momentum, etc. take effect on
+    resume.
+    """
+    for pg in adamw.param_groups:
+        pg["lr"] = train_cfg.learning_rate
+        pg["weight_decay"] = train_cfg.weight_decay
+        pg["betas"] = train_cfg.betas
+        pg["eps"] = train_cfg.eps
+
+    for pg in muon.param_groups:
+        pg["lr"] = train_cfg.muon_lr
+        pg["weight_decay"] = train_cfg.muon_weight_decay
+        pg["momentum"] = train_cfg.muon_momentum
+        pg["nesterov"] = train_cfg.muon_nesterov
+        pg["ns_steps"] = train_cfg.muon_ns_steps
+
+    adamw_scheduler.base_lrs = [
+        train_cfg.learning_rate
+    ] * len(adamw_scheduler.base_lrs)
+    muon_scheduler.base_lrs = [
+        train_cfg.muon_lr
+    ] * len(muon_scheduler.base_lrs)
+
+
 def checkpoint_payload(
     model: LevTModel,
     adamw: AdamW,
@@ -343,8 +379,8 @@ def main() -> None:
                         diffs.append(f"  {key}: checkpoint={sv!r}, train_config.json={cv!r}")
             else:
                 diffs.append(f"  checkpoint={saved_train_config!r}, train_config.json={current_train_config!r}")
-            raise ValueError(
-                "checkpoint training configuration does not match train_config.json:\n"
+            warnings.warn(
+                "train_config.json differs from checkpoint — using current config values:\n"
                 + "\n".join(diffs)
             )
     else:
@@ -390,6 +426,10 @@ def main() -> None:
         next_batch_index = int(checkpoint.get("next_batch_index", 0))
         restore_rng_state(checkpoint["rng_state"])
         checkpoint_val_loss = checkpoint.get("checkpoint_val_loss", {})
+        # Override checkpoint-stored hyperparameters with current train_config.
+        _apply_train_config_to_optimizers(
+            adamw, muon, adamw_scheduler, muon_scheduler, train_cfg,
+        )
 
     checkpoint_dir = Path(train_cfg.checkpoint_dir)
     adamw.zero_grad(set_to_none=True)
