@@ -112,6 +112,7 @@ def make_loader(
     *,
     shuffle: bool,
     shuffle_seed: Optional[int] = None,
+    resume_batch_index: int = 0,
 ) -> DataLoader:
     dataset = JsonlDataset(
         path, model_cfg,
@@ -124,21 +125,34 @@ def make_loader(
         max_target_length=train_cfg.max_target_length,
     )
     generator = None
+    sampler = None
     if shuffle:
         generator = torch.Generator()
         generator.manual_seed(train_cfg.seed if shuffle_seed is None else shuffle_seed)
+        if resume_batch_index > 0:
+            # Reconstruct the deterministic shuffle permutation so we can
+            # skip already-processed batches without loading any data.
+            # DataLoader workers only see the remaining batches.
+            n = len(dataset)
+            perm = torch.randperm(n, generator=generator).tolist()
+            start = resume_batch_index * train_cfg.batch_size
+            sampler = perm[start:] if start < n else []
+            shuffle = False         # sampler and shuffle are mutually exclusive
+            generator = None        # not needed when sampler is provided
+    has_workers = train_cfg.num_workers > 0
     loader = DataLoader(
         dataset,
         batch_size=train_cfg.batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         generator=generator,
         num_workers=train_cfg.num_workers,
         collate_fn=collator,
-        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        persistent_workers=has_workers,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=4 if has_workers else None,
     )
-    if len(loader) == 0:
+    if len(loader) == 0 and resume_batch_index == 0:
         raise ValueError(f"data loader for {path} has zero batches")
     return loader
 
@@ -420,27 +434,26 @@ def main() -> None:
             train_cfg,
             shuffle=True,
             shuffle_seed=train_cfg.seed + epoch,
+            resume_batch_index=resume_batch_index,
         )
-        if resume_batch_index >= len(train_loader):
-            # batch_size (or the dataset) may have changed since the
-            # checkpoint was saved; the stored batch position no longer
-            # fits within this epoch.  Advance to the next epoch instead
-            # of raising an error — the data those batches covered has
-            # already been processed.
+        if len(train_loader) == 0:
+            # The sampler consumed all batches in this epoch — advance.
             print(
-                f"checkpoint batch position {resume_batch_index} >= epoch "
-                f"length {len(train_loader)} — batch_size or dataset may "
-                f"have changed since the checkpoint; advancing to next epoch",
+                f"checkpoint batch position {resume_batch_index} exhausts epoch "
+                f"{epoch} — advancing to next epoch",
                 flush=True,
             )
             resume_batch_index = 0
             continue
+        batch_offset = resume_batch_index
+        resume_batch_index = 0
         if display is not None and not _display_total_set:
             # Compute the real training ceiling: max_training_steps _or_
             # epoch exhaustion — whichever comes first.  The progress bar
             # then shows "how far through what we'll actually run."
+            total_epoch_batches = batch_offset + len(train_loader)
             steps_per_epoch = math.ceil(
-                len(train_loader) / train_cfg.gradient_accumulation_steps
+                total_epoch_batches / train_cfg.gradient_accumulation_steps
             )
             remaining_epochs = train_cfg.epochs - epoch
             actual_total = min(
@@ -449,19 +462,20 @@ def main() -> None:
             )
             display.set_total(actual_total)
             _display_total_set = True
+        total_epoch_batches = batch_offset + len(train_loader)
         train_iterator = iter(enumerate(train_loader))
         for batch_index, batch in train_iterator:
+            real_batch_index = batch_index + batch_offset
             if global_step >= train_cfg.max_training_steps:
                 break
-            if batch_index < resume_batch_index:
-                continue
-            window = [(batch_index, trainer.prepare_batch(batch))]
+            window = [(real_batch_index, trainer.prepare_batch(batch))]
             for _ in range(1, train_cfg.gradient_accumulation_steps):
                 try:
-                    next_index_in_window, next_batch = next(train_iterator)
+                    next_batch_index, next_batch = next(train_iterator)
                 except StopIteration:
                     break
-                window.append((next_index_in_window, trainer.prepare_batch(next_batch)))
+                next_real_index = next_batch_index + batch_offset
+                window.append((next_real_index, trainer.prepare_batch(next_batch)))
 
             # First pass: compute all losses and collect counts
             results = []
@@ -512,7 +526,7 @@ def main() -> None:
 
             next_epoch = epoch
             next_index = last_batch_index + 1
-            if next_index == len(train_loader):
+            if next_index == total_epoch_batches:
                 next_epoch = epoch + 1
                 next_index = 0
             final_epoch = next_epoch
@@ -523,7 +537,7 @@ def main() -> None:
                     step=global_step,
                     epoch=epoch,
                     batch=last_batch_index + 1,
-                    batches_per_epoch=len(train_loader),
+                    batches_per_epoch=total_epoch_batches,
                     loss_total=metrics["loss_total"],
                     loss_plh=metrics["loss_ins_plh"],
                     loss_tok=metrics["loss_ins_tok"],

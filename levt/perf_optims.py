@@ -131,8 +131,26 @@ accelerated["clip_grad_value_"] = partial(torch.nn.utils.clip_grad_value_, forea
 accelerated["clip_grads_with_norm_"] = partial(torch.nn.utils.clip_grads_with_norm_, foreach=True)
 
 
+def _sanitize_thread_env() -> None:
+    """Unset invalid OMP_NUM_THREADS etc. to prevent forked worker crashes."""
+    _VARS = ["OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS","VECLIB_MAXIMUM_THREADS"]
+    for var in _VARS:
+        v = os.environ.get(var)
+        if v is None:
+            continue
+        try:
+            n = int(v.strip())
+            if n <= 0 or n > 2_147_483_647:
+                raise ValueError
+        except (ValueError, TypeError):
+            warnings.warn(f"{var}={v!r} invalid — unsetting to prevent worker crashes")
+            del os.environ[var]
+
+
 def set_hardware_optimizations():
     """Set hardware-specific optimizations."""
+    _sanitize_thread_env()
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     torch.set_float32_matmul_precision("high")  # Enable TensorFloat-32
     # Configure CPU thread count
