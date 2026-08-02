@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import warnings
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,37 @@ import torch
 _module: Any = None
 _load_attempted = False
 _last_error: str | None = None
+
+_NINJA_HINTS = (
+    # Directory containing the active interpreter (conda envs ship ninja here).
+    "bin",
+    # Common standalone conda roots.
+    os.path.expanduser("~/miniconda3/bin"),
+    os.path.expanduser("~/anaconda3/bin"),
+    "/usr/local/bin",
+    "/usr/bin",
+)
+
+
+def _ensure_ninja_on_path() -> None:
+    """Put ``ninja`` on ``PATH`` if it is installed but not findable.
+
+    ``torch.utils.cpp_extension.load`` requires ``ninja`` via ``shutil.which``,
+    even to load a cached build.  When training is launched from a bare shell
+    (no conda env activated), ninja is silently missing and the extension falls
+    back to the ~3.5x slower pure-Python DP.  If ninja exists next to the
+    interpreter or in a common conda root, prepend that directory so JIT
+    compilation works regardless of how the process was started.
+    """
+    if shutil.which("ninja") is not None:
+        return
+    candidates = (
+        os.path.join(os.path.dirname(sys.executable), "bin"),
+    ) + _NINJA_HINTS
+    for directory in candidates:
+        if os.path.isfile(os.path.join(directory, "ninja")):
+            os.environ["PATH"] = f"{directory}:{os.environ.get('PATH', '')}"
+            return
 
 
 def _compile_and_load() -> Any:
@@ -37,6 +69,7 @@ def _compile_and_load() -> Any:
     try:
         from torch.utils.cpp_extension import load  # type: ignore[import-untyped]
 
+        _ensure_ninja_on_path()
         source_dir = os.path.dirname(os.path.abspath(__file__))
         source_path = os.path.join(source_dir, "_levenshtein_ops.cpp")
 

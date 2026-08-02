@@ -50,6 +50,7 @@ from levt.checkpoint import capture_rng_state, restore_rng_state
 from levt.config import LevTConfig, TrainConfig
 from levt.data import JsonlDataset, LevTCollator
 from levt.embeddings import import_hf_embeddings
+from levt.fast_muon import FastMuon
 from levt.model import LevTModel
 from levt.perf_optims import accelerated, enable_all, prealloc_model_grads
 from levt.trainer import DualPolicyTrainer
@@ -167,7 +168,7 @@ def build_optimizers(model, train_cfg):
         adamw_params, lr=train_cfg.learning_rate,
         weight_decay=train_cfg.weight_decay, betas=train_cfg.betas, eps=train_cfg.eps,
     )
-    muon = accelerated.Muon(
+    muon = FastMuon(
         muon_params, lr=train_cfg.muon_lr,
         weight_decay=train_cfg.muon_weight_decay, momentum=train_cfg.muon_momentum,
         nesterov=train_cfg.muon_nesterov, ns_steps=train_cfg.muon_ns_steps,

@@ -28,6 +28,7 @@ from levt.checkpoint import (
 from levt.config import LevTConfig, TrainConfig
 from levt.data import JsonlDataset, LevTCollator
 from levt.embeddings import import_hf_embeddings
+from levt.fast_muon import FastMuon
 from levt.model import LevTModel
 from levt.perf_optims import accelerated, enable_all, prealloc_model_grads
 from levt.progress import HAS_RICH, TrainingDisplay
@@ -223,7 +224,7 @@ def build_optimizers(
         betas=train_cfg.betas,
         eps=train_cfg.eps,
     )
-    muon = accelerated.Muon(
+    muon = FastMuon(
         muon_params,
         lr=train_cfg.muon_lr,
         weight_decay=train_cfg.muon_weight_decay,
