@@ -13,22 +13,27 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <unordered_map>
+#include <memory>
 #include <vector>
 
 namespace {
 
 // ── Flat-array DP tables (1-D row-major, better cache locality) ──────────
+//
+// Raw `new[]` instead of `std::vector::resize` so the O(n·m) table is *not*
+// zero-initialized first: the DP fill overwrites every (n+1)×(m+1) entry, so
+// value-initialization was pure wasted memory traffic (perf: ~4-5% of the
+// op's self time went to libc allocation/zeroing).
 
 struct DPResult {
-    std::vector<int> d;        // (n+1) × (m+1) flattened, row-major
-    std::vector<uint8_t> back; // (n+1) × (m+1) flattened, row-major
-    int n, m;
+    std::unique_ptr<int[]> d;        // (n+1) × (m+1) flattened, row-major
+    std::unique_ptr<uint8_t[]> back; // (n+1) × (m+1) flattened, row-major
+    int n, m, stride;
 
-    int  d_at(int i, int j) const { return d[i * (m + 1) + j]; }
-    int& d_at(int i, int j)       { return d[i * (m + 1) + j]; }
-    uint8_t  back_at(int i, int j) const { return back[i * (m + 1) + j]; }
-    uint8_t& back_at(int i, int j)       { return back[i * (m + 1) + j]; }
+    int  d_at(int i, int j) const { return d[i * stride + j]; }
+    int& d_at(int i, int j)       { return d[i * stride + j]; }
+    uint8_t  back_at(int i, int j) const { return back[i * stride + j]; }
+    uint8_t& back_at(int i, int j)       { return back[i * stride + j]; }
 };
 
 DPResult edit_distance2_with_dp(const int64_t* x, int n,
@@ -36,9 +41,11 @@ DPResult edit_distance2_with_dp(const int64_t* x, int n,
     DPResult result;
     result.n = n;
     result.m = m;
-    const auto size = static_cast<size_t>((n + 1) * (m + 1));
-    result.d.resize(size);
-    result.back.resize(size);
+    result.stride = m + 1;
+    const size_t size =
+        static_cast<size_t>(n + 1) * static_cast<size_t>(m + 1);
+    result.d.reset(new int[size]);        // default-init: no zeroing
+    result.back.reset(new uint8_t[size]); // default-init: no zeroing
 
     // Initialize boundaries
     for (int i = 0; i <= n; ++i) {
@@ -53,19 +60,21 @@ DPResult edit_distance2_with_dp(const int64_t* x, int n,
     // DP fill
     for (int i = 1; i <= n; ++i) {
         const int64_t xi = x[i - 1];
+        const int row = i * result.stride;
+        const int prev_row = (i - 1) * result.stride;
         for (int j = 1; j <= m; ++j) {
             int best_val = std::numeric_limits<int>::max();
             uint8_t best_op = 0;
 
             // Delete: cost 1
-            int cand = result.d_at(i - 1, j) + 1;
+            int cand = result.d[prev_row + j] + 1;
             if (cand < best_val) {
                 best_val = cand;
                 best_op = 1;
             }
 
             // Insert: cost 1
-            cand = result.d_at(i, j - 1) + 1;
+            cand = result.d[row + (j - 1)] + 1;
             if (cand < best_val) {
                 best_val = cand;
                 best_op = 2;
@@ -73,15 +82,15 @@ DPResult edit_distance2_with_dp(const int64_t* x, int n,
 
             // Match: cost 0 if equal, can't substitute (cost would be 2)
             if (xi == y[j - 1]) {
-                cand = result.d_at(i - 1, j - 1);
+                cand = result.d[prev_row + (j - 1)];
                 if (cand < best_val) {
                     best_val = cand;
                     best_op = 0;
                 }
             }
 
-            result.d_at(i, j) = best_val;
-            result.back_at(i, j) = best_op;
+            result.d[row + j] = best_val;
+            result.back[row + j] = best_op;
         }
     }
 
@@ -108,8 +117,17 @@ torch::Tensor vector_to_tensor(const std::vector<T>& vec,
 std::tuple<torch::Tensor, std::vector<torch::Tensor>>
 levenshtein_align(torch::Tensor y, torch::Tensor y_star) {
     // ── Ensure CPU, int64, contiguous ──────────────────────────────────
-    y = y.contiguous().to(torch::kInt64).cpu();
-    y_star = y_star.contiguous().to(torch::kInt64).cpu();
+    // Fast path: training already hands us CPU/int64/contiguous tensors, in
+    // which case the three dispatches (contiguous → to → cpu) are pure
+    // overhead — skip them and read the buffer directly.
+    if (!(y.device().is_cpu() && y.scalar_type() == torch::kInt64 &&
+          y.is_contiguous())) {
+        y = y.contiguous().to(torch::kInt64).cpu();
+    }
+    if (!(y_star.device().is_cpu() && y_star.scalar_type() == torch::kInt64 &&
+          y_star.is_contiguous())) {
+        y_star = y_star.contiguous().to(torch::kInt64).cpu();
+    }
 
     const int n = static_cast<int>(y.size(0));
     const int m = static_cast<int>(y_star.size(0));
@@ -120,44 +138,32 @@ levenshtein_align(torch::Tensor y, torch::Tensor y_star) {
     // ── DP ─────────────────────────────────────────────────────────────
     DPResult dp = edit_distance2_with_dp(y_ptr, n, ys_ptr, m);
 
-    // ── Pass 1: collect deletions (backtrack) ──────────────────────────
+    // ── Single backtrack pass: deletions + insertions together ─────────
     std::vector<int64_t> deletions;
-    {
-        int i = n, j = m;
-        while (i > 0 || j > 0) {
-            uint8_t op = dp.back_at(i, j);
-            if (op == 0) {        // match
-                --i; --j;
-            } else if (op == 1) { // delete
-                --i;
-                deletions.push_back(static_cast<int64_t>(i));
-            } else {              // insert
-                --j;
-            }
-        }
-        std::reverse(deletions.begin(), deletions.end());
-    }
-
-    // ── Pass 2: collect insertions (token, after_y_index) ──────────────
     std::vector<int64_t> insertions_raw;
     std::vector<int> insertion_after;
+    deletions.reserve(static_cast<size_t>(n));
+    insertions_raw.reserve(static_cast<size_t>(m));
+    insertion_after.reserve(static_cast<size_t>(m));
 
     {
         int i = n, j = m;
         int current_after = n;
         while (i > 0 || j > 0) {
-            uint8_t op = dp.back_at(i, j);
+            const uint8_t op = dp.back_at(i, j);
             if (op == 0) {        // match
                 --i; --j;
                 current_after = i;
             } else if (op == 1) { // delete
                 --i;
+                deletions.push_back(static_cast<int64_t>(i));
             } else {              // insert
                 --j;
                 insertions_raw.push_back(ys_ptr[j]);
                 insertion_after.push_back(current_after);
             }
         }
+        std::reverse(deletions.begin(), deletions.end());
         std::reverse(insertions_raw.begin(), insertions_raw.end());
         std::reverse(insertion_after.begin(), insertion_after.end());
     }
@@ -181,36 +187,42 @@ levenshtein_align(torch::Tensor y, torch::Tensor y_star) {
     std::vector<std::vector<int64_t>> per_gap_vecs(num_gaps);
 
     if (num_gaps > 0 && !insertions_raw.empty()) {
-        std::unordered_map<int, int> surv_rank;
-        surv_rank.reserve(surviving.size());
-        for (int si = 0; si < static_cast<int>(surviving.size()); ++si) {
-            surv_rank[surviving[si]] = si;
+        // rank_of[i]  = rank of surviving token i (or -1 if deleted).
+        // num_surv_le[i] = count of surviving tokens with index <= i.
+        // Both sized n+1 so `after_y == n` (trailing insertions) is safe.
+        std::vector<int> rank_of(static_cast<size_t>(n) + 1, -1);
+        std::vector<int> num_surv_le(static_cast<size_t>(n) + 1, 0);
+        {
+            int cnt = 0;
+            for (int idx = 0; idx < n; ++idx) {
+                if (del_mask[static_cast<size_t>(idx)] == 0) {
+                    rank_of[static_cast<size_t>(idx)] = cnt++;
+                }
+                num_surv_le[static_cast<size_t>(idx)] = cnt;
+            }
+            num_surv_le[static_cast<size_t>(n)] = cnt;
         }
 
         const size_t n_ins = insertions_raw.size();
         for (size_t k = 0; k < n_ins; ++k) {
-            int64_t tok = insertions_raw[k];
-            int after_y = insertion_after[k];
+            const int after_y = insertion_after[k];
 
-            int gap_surv_idx = -1;
-            auto it = surv_rank.find(after_y);
-            if (it != surv_rank.end()) {
-                gap_surv_idx = it->second - 1;  // gap BEFORE this position
+            int gap_surv_idx;
+            const int r = rank_of[static_cast<size_t>(after_y)];
+            if (r >= 0) {
+                gap_surv_idx = r - 1;  // gap BEFORE this position
             } else {
-                // after_y points to a deleted position — find last surviving
-                // token before it
-                const int n_surv = static_cast<int>(surviving.size());
-                for (int si = 0; si < n_surv; ++si) {
-                    if (surviving[si] < after_y) {
-                        gap_surv_idx = si;
-                    } else {
-                        break;
-                    }
-                }
+                // after_y points to a deleted position — last surviving
+                // token before it is (count of survivors < after_y) - 1
+                gap_surv_idx = (after_y > 0
+                                    ? num_surv_le[static_cast<size_t>(after_y - 1)]
+                                    : 0)
+                               - 1;
             }
 
             if (gap_surv_idx >= 0 && gap_surv_idx < num_gaps) {
-                per_gap_vecs[gap_surv_idx].push_back(tok);
+                per_gap_vecs[static_cast<size_t>(gap_surv_idx)].push_back(
+                    insertions_raw[k]);
             }
         }
     }
