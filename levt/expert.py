@@ -20,10 +20,16 @@ import torch
 # Try to load the C++ acceleration module at import time.
 _cpp_module = None
 try:
-    from ._levenshtein_ops import levenshtein_align_cpp
+    from ._levenshtein_ops import (
+        levenshtein_align_cpp,
+        levenshtein_deletion_cpp_batch,
+        levenshtein_insertion_cpp_batch,
+    )
     _cpp_module = True  # module loaded; actual function may still return None
 except ImportError:
     levenshtein_align_cpp = None  # type: ignore[assignment]
+    levenshtein_deletion_cpp_batch = None  # type: ignore[assignment]
+    levenshtein_insertion_cpp_batch = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +264,77 @@ def oracle_insertion(
         t_star = torch.tensor([], dtype=torch.long)
 
     return p_star, t_star
+
+
+def _slice_packed(packed: torch.Tensor, offsets: torch.Tensor) -> List[torch.Tensor]:
+    """Split a packed flat tensor into per-sample tensors using [B+1] offsets."""
+    offsets_list = offsets.tolist()
+    return [
+        packed[offsets_list[i]:offsets_list[i + 1]]
+        for i in range(len(offsets_list) - 1)
+    ]
+
+
+def oracle_deletion_batch(
+    ys: List[torch.Tensor],
+    ys_stars: List[torch.Tensor],
+) -> List[torch.Tensor]:
+    """
+    Batched oracle deletion policy (one C++ call for the whole batch).
+
+    Returns a list with one bool mask (True = DELETE) per input pair, each of
+    length ``len(y)`` with boundaries forced ``False`` — identical to
+    ``[oracle_deletion(y, ys_) for y, ys_ in zip(ys, ys_stars)]``.
+
+    Falls back to per-sample calls when the C++ extension is unavailable.
+    """
+    if levenshtein_deletion_cpp_batch is not None:
+        result = levenshtein_deletion_cpp_batch(ys, ys_stars)
+        if result is not None:
+            del_packed, offsets = result
+            return [mask.bool() for mask in _slice_packed(del_packed, offsets)]
+    return [oracle_deletion(y, ys_) for y, ys_ in zip(ys, ys_stars)]
+
+
+def oracle_insertion_batch(
+    ys: List[torch.Tensor],
+    ys_stars: List[torch.Tensor],
+    max_placeholder: int = 255,
+    plh_token_id: int = 3,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Batched oracle insertion policy (one C++ call for the whole batch).
+
+    Returns ``(p_stars, t_stars, y_ins_plhs)`` — parallel per-sample lists
+    matching ``[oracle_insertion(...) ...]`` plus the PLH-interleaved roll-in
+    ``insert_placeholders(y, p_star)``. The three lists are aligned with
+    ``ys`` (sample ``i`` of each list belongs to pair ``i``).
+
+    Falls back to per-sample calls when the C++ extension is unavailable.
+    """
+    if levenshtein_insertion_cpp_batch is not None:
+        result = levenshtein_insertion_cpp_batch(
+            ys, ys_stars, max_placeholder, plh_token_id,
+        )
+        if result is not None:
+            (p_packed, p_offsets, t_packed, t_offsets,
+             plh_packed, plh_offsets) = result
+            return (
+                _slice_packed(p_packed, p_offsets),
+                _slice_packed(t_packed, t_offsets),
+                _slice_packed(plh_packed, plh_offsets),
+            )
+    p_stars: List[torch.Tensor] = []
+    t_stars: List[torch.Tensor] = []
+    y_ins_plhs: List[torch.Tensor] = []
+    for y, ys_ in zip(ys, ys_stars):
+        p_star, t_star = oracle_insertion(
+            y, ys_, max_placeholder=max_placeholder, plh_token_id=plh_token_id,
+        )
+        p_stars.append(p_star)
+        t_stars.append(t_star)
+        y_ins_plhs.append(insert_placeholders(y, p_star, plh_token_id=plh_token_id))
+    return p_stars, t_stars, y_ins_plhs
 
 
 # ---------------------------------------------------------------------------

@@ -11,9 +11,8 @@ import torch.nn.functional as F
 from .config import LevTConfig, PolicyConfig
 from .expert import (
     apply_deletion,
-    insert_placeholders,
-    oracle_deletion,
-    oracle_insertion,
+    oracle_deletion_batch,
+    oracle_insertion_batch,
     random_deletion,
 )
 from .model import LevTModel
@@ -51,9 +50,14 @@ class DualPolicyTrainer:
         model: LevTModel,
         config: LevTConfig,
         policy_config: Optional[PolicyConfig] = None,
+        oracle_batch_size: int = 0,
     ) -> None:
         self.model = model
         self.cfg = config
+        # Pairs per C++ oracle call. 0 = whole training batch in one call;
+        # a positive value chunks the batch (trades fixed per-call overhead
+        # against per-call latency / memory).
+        self._oracle_batch_size = int(oracle_batch_size)
         self.policy = policy_config or PolicyConfig(
             alpha=0.5 if config.alpha is None else config.alpha,
             beta=0.5 if config.beta is None else config.beta,
@@ -64,6 +68,19 @@ class DualPolicyTrainer:
                 0.1 if config.label_smoothing is None else config.label_smoothing
             ),
         )
+
+    def _oracle_chunks(self, n: int):
+        """Yield (start, end) ranges for chunking ``n`` pairs into oracle calls.
+
+        ``oracle_batch_size == 0`` yields a single whole-batch range (one C++
+        call); a positive value yields ranges of that size.
+        """
+        bs = self._oracle_batch_size
+        if bs <= 0 or bs >= n:
+            yield 0, n
+            return
+        for start in range(0, n, bs):
+            yield start, min(start + bs, n)
 
     def prepare_batch(
         self,
@@ -100,15 +117,51 @@ class DualPolicyTrainer:
                     t_star.append(batch["t_star_rnd"][i])
                     y_ins_plh.append(batch["y_ins_plh_rnd"][i])
         else:
-            # Original computation (backward compatible)
-            insertion = [
-                self._build_insertion_data(seed, target)
-                for seed, target in zip(initial, targets)
+            # Batched oracle computation (backward compatible; falls back to
+            # per-sample calls when the C++ extension is unavailable).
+            # Beta / random branch decisions are drawn in index order to keep
+            # the torch.rand + random.random RNG streams identical to the
+            # original per-sample loop.
+            use_oracle = [
+                torch.rand(()).item() < self.policy.beta for _ in initial
             ]
-            y_ins = [item[0] for item in insertion]
-            p_star = [item[1] for item in insertion]
-            t_star = [item[2] for item in insertion]
-            y_ins_plh = [item[3] for item in insertion]
+            oracle_idx = [i for i, u in enumerate(use_oracle) if u]
+            rnd_idx = [i for i, u in enumerate(use_oracle) if not u]
+
+            ins_by_idx: Dict[int, torch.Tensor] = {}
+            if oracle_idx:
+                sub_y0 = [initial[i] for i in oracle_idx]
+                sub_targets = [targets[i] for i in oracle_idx]
+                masks: List[torch.Tensor] = []
+                for s, e in self._oracle_chunks(len(sub_y0)):
+                    masks.extend(oracle_deletion_batch(sub_y0[s:e], sub_targets[s:e]))
+                for k, i in enumerate(oracle_idx):
+                    ins_by_idx[i] = apply_deletion(initial[i], masks[k])
+
+            for k, i in enumerate(rnd_idx):
+                ins_by_idx[i] = random_deletion(
+                    targets[i],
+                    drop_prob=self.policy.random_delete_prob,
+                    bos_idx=self.cfg.bos_token_id,
+                    eos_idx=self.cfg.eos_token_id,
+                    pad_idx=self.cfg.pad_token_id,
+                )
+
+            y_ins = [ins_by_idx[i] for i in range(len(initial))]
+
+            p_star_parts: List[torch.Tensor] = []
+            t_star_parts: List[torch.Tensor] = []
+            plh_parts: List[torch.Tensor] = []
+            for s, e in self._oracle_chunks(len(y_ins)):
+                p_part, t_part, plh_part = oracle_insertion_batch(
+                    y_ins[s:e], targets[s:e],
+                    max_placeholder=self.cfg.max_placeholder,
+                    plh_token_id=self.cfg.plh_token_id,
+                )
+                p_star_parts.extend(p_part)
+                t_star_parts.extend(t_part)
+                plh_parts.extend(plh_part)
+            p_star, t_star, y_ins_plh = p_star_parts, t_star_parts, plh_parts
 
         return PreparedBatch(
             src, src_mask, y_ins, p_star, y_ins_plh, t_star, [], [], initial, targets,
@@ -128,15 +181,20 @@ class DualPolicyTrainer:
             )
 
         y_del: List[torch.Tensor] = []
-        d_star: List[torch.Tensor] = []
+        roll_ins: List[torch.Tensor] = []
         for seed, filled, target in zip(prepared.initial, model_filled, prepared.targets):
             roll_in = seed if torch.rand((), device="cpu").item() < self.policy.alpha else filled
             roll_in = roll_in.detach().cpu()
             y_del.append(roll_in)
-            d_star.append(oracle_deletion(
-                roll_in, target,
-                bos_idx=self.cfg.bos_token_id,
-                eos_idx=self.cfg.eos_token_id,
+            roll_ins.append(roll_in)
+
+        # Batched C++ alignments (per-sample fallback if the extension is
+        # unavailable). bos/eos are vestigial — the mask always keeps
+        # positions 0 and n-1.
+        d_star: List[torch.Tensor] = []
+        for s, e in self._oracle_chunks(len(roll_ins)):
+            d_star.extend(oracle_deletion_batch(
+                roll_ins[s:e], prepared.targets[s:e],
             ))
 
         prepared.y_del = y_del
@@ -293,30 +351,6 @@ class DualPolicyTrainer:
             "initial": [y0],
             "targets": [y_star],
         }
-
-    def _build_insertion_data(
-        self, y0: torch.Tensor, target: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if torch.rand((), device="cpu").item() < self.policy.beta:
-            deletion = oracle_deletion(
-                y0, target, self.cfg.bos_token_id, self.cfg.eos_token_id,
-            )
-            y_ins = apply_deletion(y0, deletion)
-        else:
-            y_ins = random_deletion(
-                target,
-                drop_prob=self.policy.random_delete_prob,
-                bos_idx=self.cfg.bos_token_id,
-                eos_idx=self.cfg.eos_token_id,
-                pad_idx=self.cfg.pad_token_id,
-            )
-        p_star, t_star = oracle_insertion(
-            y_ins, target,
-            max_placeholder=self.cfg.max_placeholder,
-            plh_token_id=self.cfg.plh_token_id,
-        )
-        y_with_plh = insert_placeholders(y_ins, p_star, self.cfg.plh_token_id)
-        return y_ins, p_star, t_star, y_with_plh
 
     def _model_fill_batch(
         self,

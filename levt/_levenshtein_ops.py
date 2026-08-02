@@ -91,6 +91,41 @@ def levenshtein_align_cpp(
     return mod.levenshtein_align(y, y_star)
 
 
+def levenshtein_deletion_cpp_batch(
+    ys: list[torch.Tensor], ys_stars: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """
+    C++ batched deletion oracle.
+
+    Returns ``(mask_packed, offsets)`` — a uint8 flat tensor of per-sample
+    concatenated delete flags plus a ``[B+1]`` int64 offsets tensor — or
+    ``None`` if the extension is unavailable.
+    """
+    mod = _get_module()
+    if mod is None:
+        return None
+    return mod.levenshtein_deletion_batch(ys, ys_stars)
+
+
+def levenshtein_insertion_cpp_batch(
+    ys: list[torch.Tensor],
+    ys_stars: list[torch.Tensor],
+    max_placeholder: int,
+    plh_token_id: int,
+) -> tuple[torch.Tensor, ...] | None:
+    """
+    C++ batched insertion oracle.
+
+    Returns ``(p_star_packed, p_star_offsets, t_star_packed, t_star_offsets,
+    y_ins_plh_packed, y_ins_plh_offsets)`` or ``None`` if the extension is
+    unavailable.
+    """
+    mod = _get_module()
+    if mod is None:
+        return None
+    return mod.levenshtein_insertion_batch(ys, ys_stars, max_placeholder, plh_token_id)
+
+
 # ---------------------------------------------------------------------------
 # Pre-flight verification (called before training starts)
 # ---------------------------------------------------------------------------
@@ -163,6 +198,39 @@ def verify_cpp_extension() -> CppExtensionStatus:
             available=False,
             error=f"Smoke test produced wrong result: {result} != "
                   f"({expected_deletions}, {expected_per_gap})",
+            fix_hint="The cached .so may be from a different source version. "
+                     "Remove ~/.cache/torch_extensions and re-run.",
+        )
+
+    # ── 4. Batched packed oracles (same inputs) ────────────────────────
+    try:
+        del_packed, del_offsets = mod.levenshtein_deletion_batch([y], [y_star])
+        (p_packed, p_offsets, t_packed, t_offsets,
+         plh_packed, plh_offsets) = mod.levenshtein_insertion_batch(
+            [y], [y_star], 255, 3)
+    except Exception as exc:
+        return CppExtensionStatus(
+            available=False,
+            error=f"C++ extension loaded but batched smoke test raised: {exc}",
+            fix_hint="The cached .so may be stale — try removing "
+                     "~/.cache/torch_extensions and re-running.",
+        )
+
+    # y=[1,2], y_star=[1,3,4,2] → deletions none; 1 gap [3,4]:
+    #   deletion mask [0,0]; p_star [2]; t_star [3,4]; plh roll-in [1,3,3,2].
+    if not torch.equal(del_packed, torch.tensor([0, 0], dtype=torch.uint8)) or \
+       not torch.equal(del_offsets, torch.tensor([0, 2], dtype=torch.long)) or \
+       not torch.equal(p_packed, torch.tensor([2], dtype=torch.long)) or \
+       not torch.equal(t_packed, torch.tensor([3, 4], dtype=torch.long)) or \
+       not torch.equal(plh_packed, torch.tensor([1, 3, 3, 2], dtype=torch.long)) or \
+       not torch.equal(p_offsets, torch.tensor([0, 1], dtype=torch.long)) or \
+       not torch.equal(t_offsets, torch.tensor([0, 2], dtype=torch.long)) or \
+       not torch.equal(plh_offsets, torch.tensor([0, 4], dtype=torch.long)):
+        return CppExtensionStatus(
+            available=False,
+            error=f"Smoke test produced wrong batched result: "
+                  f"({del_packed}, {del_offsets}, {p_packed}, {t_packed}, "
+                  f"{plh_packed})",
             fix_hint="The cached .so may be from a different source version. "
                      "Remove ~/.cache/torch_extensions and re-run.",
         )

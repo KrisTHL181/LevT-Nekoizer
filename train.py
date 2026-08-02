@@ -400,7 +400,10 @@ def main() -> None:
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
 
-    trainer = DualPolicyTrainer(model, model_cfg, train_cfg.policy)
+    trainer = DualPolicyTrainer(
+        model, model_cfg, train_cfg.policy,
+        oracle_batch_size=train_cfg.oracle_batch_size,
+    )
     adamw, muon = build_optimizers(model, train_cfg)
     adamw_scheduler = LambdaLR(
         adamw,

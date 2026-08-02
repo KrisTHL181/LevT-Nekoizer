@@ -224,6 +224,7 @@ class TrainConfig:
     hf_model_name_or_path: str
     validation_data: Optional[str] = None
     batch_size: int = 8
+    oracle_batch_size: int = 0
     num_workers: int = 0
     max_source_length: int = 1024
     max_target_length: int = 1024
@@ -276,6 +277,9 @@ class TrainConfig:
         ):
             _positive_int(name, getattr(self, name))
         _positive_int("num_workers", self.num_workers, allow_zero=True)
+        # 0 = process the whole training batch in one C++ oracle call; a
+        # positive value chunks the batch into groups of that size.
+        _positive_int("oracle_batch_size", self.oracle_batch_size, allow_zero=True)
         _positive_int("warmup_steps", self.warmup_steps, allow_zero=True)
         PolicyConfig(self.alpha, self.beta, self.random_delete_prob, self.label_smoothing)
         for name in ("learning_rate", "weight_decay", "eps", "max_grad_norm"):
