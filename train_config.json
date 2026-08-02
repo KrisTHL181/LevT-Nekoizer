@@ -2,7 +2,7 @@
   "train_data": "zhihu_train.jsonl",
   "validation_data": "zhihu_valid.jsonl",
   "hf_model_name_or_path": "openbmb/MiniCPM4-0.5B",
-  "batch_size": 16,
+  "batch_size": 24,
   "oracle_batch_size": 0,
   "num_workers": 0,
   "max_source_length": 1024,
