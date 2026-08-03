@@ -122,11 +122,13 @@ def make_loader(
         path, model_cfg,
         max_source_length=train_cfg.max_source_length,
         max_target_length=train_cfg.max_target_length,
+        allow_interior_boundaries=train_cfg.packed,
     )
     collator = LevTCollator(
         model_cfg,
         max_source_length=train_cfg.max_source_length,
         max_target_length=train_cfg.max_target_length,
+        allow_interior_boundaries=train_cfg.packed,
     )
     generator = None
     sampler = None

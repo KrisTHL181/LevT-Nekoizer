@@ -147,6 +147,37 @@ def validate_ids(ids: List[int], vocab_size: int, line_num: int, field: str) -> 
             )
 
 
+def warn_interior_boundary_tokens(
+    ids: List[int],
+    bos_token_id: Optional[int],
+    eos_token_id: Optional[int],
+    line_num: int,
+    field: str,
+) -> None:
+    """Warn if BOS/EOS appear inside a sequence; only the boundaries are valid.
+
+    LevT training data rejects interior BOS/EOS (the deletion oracle never
+    touches them and the decoder masks them from fill predictions), but they
+    slip in when the raw text literally contains a string that tokenizes to
+    the BOS/EOS id (e.g. ``<s>`` in a code string). This is a warning, not a
+    hard error: the training-side validator in ``levt.data`` still catches any
+    rows that slip through.
+    """
+    if len(ids) < 2:
+        return
+    for index, tid in enumerate(ids):
+        if index in (0, len(ids) - 1):
+            continue  # boundary BOS/EOS is expected
+        if tid == bos_token_id or tid == eos_token_id:
+            label = "<bos>" if tid == bos_token_id else "<eos>"
+            print(
+                f"Warning: line {line_num} '{field}' has interior {label} "
+                f"(id {tid}) at position {index}; LevT training data rejects this",
+                file=sys.stderr,
+            )
+            return
+
+
 def process_dry_run(
     rows: List[Dict[str, Any]],
     tokenizer,
@@ -371,6 +402,16 @@ def main() -> None:
             validate_ids(src_ids, vocab_size, line_display, args.src_field)
             validate_ids(tgt_ids, vocab_size, line_display, args.target_field)
 
+            # Warn about interior BOS/EOS (LevT training data rejects these rows)
+            warn_interior_boundary_tokens(
+                src_ids, config.get("bos_token_id"), config.get("eos_token_id"),
+                line_display, args.src_field,
+            )
+            warn_interior_boundary_tokens(
+                tgt_ids, config.get("bos_token_id"), config.get("eos_token_id"),
+                line_display, args.target_field,
+            )
+
             # Build output row (preserving all original keys, replacing tokenized ones)
             out_row = dict(row)  # shallow copy preserves extra keys
             out_row[args.src_field] = src_ids
@@ -388,6 +429,10 @@ def main() -> None:
                     sys.exit(1)
                 init_ids = tokenize_text(tokenizer, init_text, max_tgt_len, config)
                 validate_ids(init_ids, vocab_size, line_display, args.initial_field)
+                warn_interior_boundary_tokens(
+                    init_ids, config.get("bos_token_id"), config.get("eos_token_id"),
+                    line_display, args.initial_field,
+                )
                 out_row[args.initial_field] = init_ids
 
             # Write

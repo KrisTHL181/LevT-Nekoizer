@@ -18,7 +18,7 @@
   "max_source_positions": 1024,
   "max_target_positions": 1024,
   "qk_norm": true,
-  "headwise_attn_output_gate": false,
+  "headwise_attn_output_gate": true,
   "elementwise_attn_output_gate": false,
   "max_placeholder": 255,
   "early_exit_del": null,

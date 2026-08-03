@@ -76,7 +76,16 @@ def validate_record(
     max_target_length: int,
     max_placeholder: int,
     source: str = "record",
+    allow_interior_boundaries: bool = False,
 ) -> Dict[str, List[int]]:
+    """Validate one JSONL row.
+
+    ``allow_interior_boundaries`` relaxes the interior BOS/EOS check on
+    target/initial so concatenated (packed) rows are accepted — the packed
+    format deliberately contains ``[EOS][BOS]`` boundaries between segments.
+    The BOS-start / EOS-end invariant and the reserved-token checks still
+    apply.
+    """
     if not isinstance(record, dict):
         raise ValueError(f"{source}: row must be a JSON object")
     _ALLOWED_KEYS = {
@@ -116,7 +125,11 @@ def validate_record(
         for index, token in enumerate(sequence):
             if token in forbidden:
                 raise ValueError(f"{source}: {name}[{index}] contains a reserved training token")
-            if index not in (0, len(sequence) - 1) and token in {config.bos_token_id, config.eos_token_id}:
+            if (
+                not allow_interior_boundaries
+                and index not in (0, len(sequence) - 1)
+                and token in {config.bos_token_id, config.eos_token_id}
+            ):
                 raise ValueError(f"{source}: {name} contains an interior BOS/EOS token")
 
     result = {"src": src, "target": target, "initial": initial}
@@ -151,6 +164,7 @@ class JsonlDataset(Dataset):
         *,
         max_source_length: int,
         max_target_length: int,
+        allow_interior_boundaries: bool = False,
     ) -> None:
         self.path = Path(path)
         self.config = config
@@ -170,6 +184,7 @@ class JsonlDataset(Dataset):
                         max_target_length=max_target_length,
                         max_placeholder=config.max_placeholder,
                         source=f"{self.path}:{line_number}",
+                        allow_interior_boundaries=allow_interior_boundaries,
                     ))
         except OSError as exc:
             raise ValueError(f"failed to read {self.path}: {exc}") from exc
@@ -199,10 +214,12 @@ class LevTCollator:
         *,
         max_source_length: int,
         max_target_length: int,
+        allow_interior_boundaries: bool = False,
     ) -> None:
         self.config = config
         self.max_source_length = max_source_length
         self.max_target_length = max_target_length
+        self.allow_interior_boundaries = allow_interior_boundaries
 
     def __call__(self, rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if not rows:
@@ -213,6 +230,7 @@ class LevTCollator:
             max_target_length=self.max_target_length,
             max_placeholder=self.config.max_placeholder,
             source=f"batch row {index}",
+            allow_interior_boundaries=self.allow_interior_boundaries,
         ) for index, row in enumerate(rows)]
         src, src_mask = _pad_seq_first([row["src"] for row in validated], self.config.pad_token_id)
         result: Dict[str, Any] = {

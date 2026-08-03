@@ -188,17 +188,7 @@ class DualPolicyTrainer:
             y_del.append(roll_in)
             roll_ins.append(roll_in)
 
-        # Batched C++ alignments (per-sample fallback if the extension is
-        # unavailable). bos/eos are vestigial — the mask always keeps
-        # positions 0 and n-1.
-        d_star: List[torch.Tensor] = []
-        for s, e in self._oracle_chunks(len(roll_ins)):
-            d_star.extend(oracle_deletion_batch(
-                roll_ins[s:e], prepared.targets[s:e],
-            ))
-
         prepared.y_del = y_del
-        prepared.d_star = d_star
 
         # --- Combined batched decoder pass for all three heads ---
         bs = len(prepared.y_ins)
@@ -241,6 +231,18 @@ class DualPolicyTrainer:
             return_deletion=True, return_placeholder=True, return_token=True,
             token_positions=tok_pos_combined,
         )
+
+        # Batched C++ alignments (per-sample fallback if the extension is
+        # unavailable). bos/eos are vestigial — the mask always keeps
+        # positions 0 and n-1.  Computed AFTER the decoder forward is enqueued
+        # so this CPU-bound work overlaps the GPU pass: d_star only feeds the
+        # deletion targets, never the forward itself.
+        d_star: List[torch.Tensor] = []
+        for s, e in self._oracle_chunks(len(roll_ins)):
+            d_star.extend(oracle_deletion_batch(
+                roll_ins[s:e], prepared.targets[s:e],
+            ))
+        prepared.d_star = d_star
 
         # Split outputs back
         plh_out = out["plh_logits"][:, :bs, :]       # (max_len-1, bs, plh_classes)

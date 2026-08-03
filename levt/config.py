@@ -227,6 +227,7 @@ class TrainConfig:
     oracle_batch_size: int = 0
     num_workers: int = 0
     prefetch_maxsize: int = 5
+    packed: bool = False
     max_source_length: int = 1024
     max_target_length: int = 1024
     local_files_only: bool = False
@@ -268,7 +269,7 @@ class TrainConfig:
             raise ValueError("train_data must be a nonempty path")
         if not isinstance(self.hf_model_name_or_path, str) or not self.hf_model_name_or_path:
             raise ValueError("hf_model_name_or_path must be nonempty")
-        for name in ("local_files_only", "trust_remote_code", "freeze_embeddings"):
+        for name in ("local_files_only", "trust_remote_code", "freeze_embeddings", "packed"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         for name in (
