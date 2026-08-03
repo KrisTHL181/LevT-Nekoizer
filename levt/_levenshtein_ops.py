@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any
@@ -59,6 +60,65 @@ def _ensure_ninja_on_path() -> None:
             return
 
 
+_STALE_LOCK_SECONDS = 300
+"""A real build of ``_levenshtein_ops.cpp`` finishes in well under this.
+
+Used to decide whether an orphaned ``FileBaton`` lock is safe to remove.
+"""
+
+
+def _clear_stale_compile_lock(name: str) -> None:
+    """Remove an orphaned compile lock so ``load()`` cannot deadlock forever.
+
+    ``torch.utils.cpp_extension.load`` guards compilation with a file-based
+    ``FileBaton`` lock whose ``wait()`` loops forever while the lock file
+    exists (it never times out).  If a process is killed mid-compile the lock
+    file is left behind, and every later ``load()`` hangs indefinitely with no
+    error message — a silent permanent stall at startup.
+
+    We unlink such a lock only when it is clearly abandoned: it is old
+    (older than ``_STALE_LOCK_SECONDS``) **and** a fully built ``.so`` already
+    exists that is at least as fresh as the lock.  A genuinely concurrent
+    build holds a young lock and has no complete ``.so``, so it is never
+    touched.  Removal is best-effort; if anything is ambiguous we leave the
+    lock alone and let the normal (or failing) path proceed.
+    """
+    try:
+        from torch.utils.cpp_extension import _get_build_directory
+    except ImportError:  # pragma: no cover - torch always ships this
+        return
+
+    try:
+        build_dir = _get_build_directory(name, verbose=False)
+    except Exception:
+        return
+
+    lock_path = os.path.join(build_dir, "lock")
+    if not os.path.exists(lock_path):
+        return
+
+    so_path = os.path.join(build_dir, f"{name}.so")
+    try:
+        lock_mtime = os.path.getmtime(lock_path)
+    except OSError:
+        return
+
+    if time.time() - lock_mtime < _STALE_LOCK_SECONDS:
+        return  # young lock: a real build is (or was just) in progress
+    if not (os.path.exists(so_path) and os.path.getmtime(so_path) >= lock_mtime):
+        return  # no complete .so yet: not safe to treat as stale
+
+    try:
+        os.unlink(lock_path)
+        warnings.warn(
+            f"Removed stale compile lock {lock_path!r} "
+            "(a previous build was interrupted).",
+            RuntimeWarning,
+        )
+    except OSError:
+        pass
+
+
 def _compile_and_load() -> Any:
     """Try to JIT-compile and load the C++ extension.  Returns module or None."""
     global _module, _load_attempted, _last_error
@@ -72,6 +132,10 @@ def _compile_and_load() -> Any:
         _ensure_ninja_on_path()
         source_dir = os.path.dirname(os.path.abspath(__file__))
         source_path = os.path.join(source_dir, "_levenshtein_ops.cpp")
+
+        # A killed build can orphan the FileBaton lock and make load() hang
+        # forever.  Clear such a stale lock before compiling/loading.
+        _clear_stale_compile_lock("_levt_levenshtein_ops")
 
         if not os.path.exists(source_path):
             _last_error = f"C++ source not found at {source_path!r}"
