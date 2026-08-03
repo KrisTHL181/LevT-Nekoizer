@@ -226,6 +226,7 @@ class TrainConfig:
     batch_size: int = 8
     oracle_batch_size: int = 0
     num_workers: int = 0
+    prefetch_maxsize: int = 5
     max_source_length: int = 1024
     max_target_length: int = 1024
     local_files_only: bool = False
@@ -280,6 +281,7 @@ class TrainConfig:
         # 0 = process the whole training batch in one C++ oracle call; a
         # positive value chunks the batch into groups of that size.
         _positive_int("oracle_batch_size", self.oracle_batch_size, allow_zero=True)
+        _positive_int("prefetch_maxsize", self.prefetch_maxsize)
         _positive_int("warmup_steps", self.warmup_steps, allow_zero=True)
         PolicyConfig(self.alpha, self.beta, self.random_delete_prob, self.label_smoothing)
         for name in ("learning_rate", "weight_decay", "eps", "max_grad_norm"):

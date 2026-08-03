@@ -7,7 +7,9 @@ import argparse
 import contextlib
 import csv
 import math
+import queue
 import random
+import threading
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -157,6 +159,68 @@ def make_loader(
     if len(loader) == 0 and resume_batch_index == 0:
         raise ValueError(f"data loader for {path} has zero batches")
     return loader
+
+
+class PrefetchBatchIterator:
+    """Wrap ``enumerate(train_loader)`` with async ``prepare_batch`` prefetching.
+
+    A single background daemon thread advances the underlying iterator and runs
+    the CPU-bound oracle computation (``trainer.prepare_batch``) for the NEXT
+    batches while the main thread performs the GPU forward/backward for the
+    current batch.  Prepared batches are returned in the same order as the
+    underlying iterator through a bounded FIFO queue, so the training loop's
+    batch-index / gradient-accumulation window / epoch-end semantics are
+    unchanged: ``next(self)`` yields ``(index, PreparedBatch)`` exactly as
+    ``enumerate(train_loader)`` would have yielded ``(index, raw_batch)``.
+
+    RNG caveat: ``prepare_batch`` draws ``torch.rand`` (beta branch) and
+    ``random.random`` (``random_deletion``).  PyTorch's default CPU generator is
+    thread-local, so the worker adopts the main thread's torch + Python RNG
+    state once at startup and then consumes those streams in batch order (no
+    per-batch re-seeding — the global streams are used throughout).  The worker
+    runs a couple of batches ahead of the main thread, so checkpoint RNG
+    capture/restore can be offset by that lookahead: after resume the first ~2
+    batches may get slightly different roll-ins (statistically equivalent —
+    still valid training).
+    """
+
+    def __init__(self, iterator, prepare_fn, maxsize: int = 2) -> None:
+        self._iterator = iterator
+        self._prepare_fn = prepare_fn
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=int(maxsize))
+        self._sentinel: Any = object()
+        # Snapshot the main thread's RNG streams so the worker continues the
+        # same seeded streams instead of starting from an unseeded thread-local
+        # torch generator (torch's default CPU generator is thread-local).
+        self._main_rng_state = torch.get_rng_state()
+        self._main_random_state = random.getstate()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="prepare-batch-prefetch",
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            torch.set_rng_state(self._main_rng_state)
+            random.setstate(self._main_random_state)
+            for index, batch in self._iterator:
+                prepared = self._prepare_fn(batch)
+                self._queue.put((index, prepared))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on main thread
+            self._queue.put((self._sentinel, exc))
+            return
+        self._queue.put((self._sentinel, self._sentinel))
+
+    def __iter__(self) -> "PrefetchBatchIterator":
+        return self
+
+    def __next__(self) -> Any:
+        index, payload = self._queue.get()
+        if index is self._sentinel:
+            if payload is self._sentinel:
+                raise StopIteration
+            raise payload
+        return index, payload
 
 
 def scheduler_factor(step: int, warmup: int, total: int) -> float:
@@ -507,19 +571,25 @@ def main() -> None:
             display.set_total(actual_total)
             _display_total_set = True
         total_epoch_batches = batch_offset + len(train_loader)
-        train_iterator = iter(enumerate(train_loader))
-        for batch_index, batch in train_iterator:
+        # Prefetch prepare_batch on a background daemon thread so the CPU-bound
+        # Levenshtein oracle computation for the next batch overlaps with the
+        # current batch's GPU forward/backward.
+        train_iterator = PrefetchBatchIterator(
+            enumerate(train_loader), trainer.prepare_batch,
+            maxsize=train_cfg.prefetch_maxsize,
+        )
+        for batch_index, prepared in train_iterator:
             real_batch_index = batch_index + batch_offset
             if global_step >= train_cfg.max_training_steps:
                 break
-            window = [(real_batch_index, trainer.prepare_batch(batch))]
+            window = [(real_batch_index, prepared)]
             for _ in range(1, train_cfg.gradient_accumulation_steps):
                 try:
-                    next_batch_index, next_batch = next(train_iterator)
+                    next_batch_index, next_prepared = next(train_iterator)
                 except StopIteration:
                     break
                 next_real_index = next_batch_index + batch_offset
-                window.append((next_real_index, trainer.prepare_batch(next_batch)))
+                window.append((next_real_index, next_prepared))
 
             # First pass: compute all losses and collect counts
             results = []
