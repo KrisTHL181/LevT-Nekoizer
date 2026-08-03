@@ -16,6 +16,11 @@ from .expert import (
     random_deletion,
 )
 from .model import LevTModel
+from .segment_mask import (
+    cross_attention_mask,
+    segment_ids,
+    self_attention_mask,
+)
 
 
 @dataclass
@@ -134,7 +139,10 @@ class DualPolicyTrainer:
                 sub_targets = [targets[i] for i in oracle_idx]
                 masks: List[torch.Tensor] = []
                 for s, e in self._oracle_chunks(len(sub_y0)):
-                    masks.extend(oracle_deletion_batch(sub_y0[s:e], sub_targets[s:e]))
+                    masks.extend(oracle_deletion_batch(
+                        sub_y0[s:e], sub_targets[s:e],
+                        bos_idx=self.cfg.bos_token_id, eos_idx=self.cfg.eos_token_id,
+                    ))
                 for k, i in enumerate(oracle_idx):
                     ins_by_idx[i] = apply_deletion(initial[i], masks[k])
 
@@ -157,6 +165,7 @@ class DualPolicyTrainer:
                     y_ins[s:e], targets[s:e],
                     max_placeholder=self.cfg.max_placeholder,
                     plh_token_id=self.cfg.plh_token_id,
+                    bos_idx=self.cfg.bos_token_id, eos_idx=self.cfg.eos_token_id,
                 )
                 p_star_parts.extend(p_part)
                 t_star_parts.extend(t_part)
@@ -172,12 +181,26 @@ class DualPolicyTrainer:
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
         """Return differentiable per-head loss sums and valid-label counts."""
         device = next(self.model.parameters()).device
-        memory = self.model.encode(prepared.src_tokens, prepared.src_padding_mask)
+        # Packed-segment attention mask for the encoder (unpacked batches keep
+        # src_attn = None so the encode path is unchanged and zero-overhead).
+        src_ids = segment_ids(
+            prepared.src_tokens.transpose(0, 1),
+            self.cfg.bos_token_id, self.cfg.eos_token_id,
+        )
+        src_has_multi = bool(src_ids.gt(0).any().item())
+        src_attn = (
+            None if not src_has_multi
+            else self_attention_mask(src_ids).unsqueeze(1)
+        )
+        memory = self.model.encode(
+            prepared.src_tokens, prepared.src_padding_mask, attn_mask=src_attn,
+        )
 
         # --- Deferred fill + deletion oracle (uses detached memory) ---
         with torch.no_grad():
             model_filled = self._model_fill_batch(
                 memory.detach(), prepared.src_padding_mask, prepared.y_ins_plh,
+                src_has_multi=src_has_multi, src_ids=src_ids,
             )
 
         y_del: List[torch.Tensor] = []
@@ -225,11 +248,28 @@ class DualPolicyTrainer:
             positions = sequence.eq(self.cfg.plh_token_id)
             tok_pos_combined[:sequence.numel(), bs + batch_index] = positions.to(device)
 
+        # Packed-segment masks for the combined decoder pass.  ``combined`` is
+        # (max_len, 3*bs); its padding columns are never counted as new
+        # segments because pad != bos/eos.  Masks stay None for unpacked data.
+        combined_tgt_attn: Optional[torch.Tensor] = None
+        combined_cross_attn: Optional[torch.Tensor] = None
+        if src_has_multi:
+            combined_ids = segment_ids(
+                combined.transpose(0, 1),
+                self.cfg.bos_token_id, self.cfg.eos_token_id,
+            )
+            combined_tgt_attn = self_attention_mask(combined_ids).unsqueeze(1)
+            src_ids_3x = src_ids.repeat(3, 1)
+            combined_cross_attn = cross_attention_mask(
+                combined_ids, src_ids_3x,
+            ).unsqueeze(1)
+
         # Single decoder call — return all three heads
         out = self.model.decode_with_memory(
             memory_3x, combined, src_mask_3x, combined_mask,
             return_deletion=True, return_placeholder=True, return_token=True,
             token_positions=tok_pos_combined,
+            tgt_attn_mask=combined_tgt_attn, cross_attn_mask=combined_cross_attn,
         )
 
         # Batched C++ alignments (per-sample fallback if the extension is
@@ -241,6 +281,7 @@ class DualPolicyTrainer:
         for s, e in self._oracle_chunks(len(roll_ins)):
             d_star.extend(oracle_deletion_batch(
                 roll_ins[s:e], prepared.targets[s:e],
+                bos_idx=self.cfg.bos_token_id, eos_idx=self.cfg.eos_token_id,
             ))
         prepared.d_star = d_star
 
@@ -359,14 +400,26 @@ class DualPolicyTrainer:
         memory: torch.Tensor,
         src_mask: torch.Tensor,
         sequences: Sequence[torch.Tensor],
+        src_has_multi: bool = False,
+        src_ids: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         device = memory.device
         tokens, padding_mask = self._pad(sequences, device)
         positions = tokens.eq(self.cfg.plh_token_id)
+        tgt_attn_mask: Optional[torch.Tensor] = None
+        cross_attn_mask: Optional[torch.Tensor] = None
+        if src_has_multi:
+            tgt_ids = segment_ids(
+                tokens.transpose(0, 1),
+                self.cfg.bos_token_id, self.cfg.eos_token_id,
+            )
+            tgt_attn_mask = self_attention_mask(tgt_ids).unsqueeze(1)
+            cross_attn_mask = cross_attention_mask(tgt_ids, src_ids).unsqueeze(1)
         logits = self.model.decode_with_memory(
             memory, tokens, src_mask, padding_mask,
             return_deletion=False, return_placeholder=False, return_token=True,
             token_positions=positions,
+            tgt_attn_mask=tgt_attn_mask, cross_attn_mask=cross_attn_mask,
         )["tok_logits"]
         predictions = logits.argmax(dim=-1)
         predicted_tokens = tokens.clone()

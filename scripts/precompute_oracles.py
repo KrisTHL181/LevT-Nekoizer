@@ -6,6 +6,9 @@ Reads already-tokenized JSONL with ``src``, ``target``, and optional ``initial``
 and pre-computes both the oracle-deletion and random-deletion insertion paths.
 Outputs the original fields plus 8 new pre-computed fields.
 
+An optional ``{"__meta__": {...}}`` header on the input is skipped and
+forwarded to the output, so a packed dataset keeps its packed marker.
+
 Usage::
 
     python scripts/precompute_oracles.py config.json policy_config.json input.jsonl output.jsonl
@@ -20,6 +23,11 @@ import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
+
+# Make the repo root importable when run as ``python scripts/precompute_oracles.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from levt.dataset_meta import META_KEY, dataset_header
 
 import torch
 
@@ -159,6 +167,7 @@ def main() -> None:
         print(f"Error: input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
+    input_header: Dict[str, Any] | None = None
     rows: List[Dict[str, Any]] = []
     with open(input_path, "r", encoding="utf-8") as f:
         for line_number, line in enumerate(f, 1):
@@ -177,6 +186,9 @@ def main() -> None:
                 print(f"Error: non-object at {input_path}:{line_number}",
                       file=sys.stderr)
                 sys.exit(1)
+            if line_number == 1 and META_KEY in row:
+                input_header = row  # forward to output below
+                continue
             if "src" not in row or "target" not in row:
                 print(f"Error: missing src/target at {input_path}:{line_number}",
                       file=sys.stderr)
@@ -201,6 +213,10 @@ def main() -> None:
     output_path = Path(args.output)
     written = 0
     with open(output_path, "w", encoding="utf-8") as out_f:
+        # Forward the input's metadata header (keeps packed datasets marked
+        # packed); legacy inputs without a header become regular.
+        header = input_header if input_header is not None else dataset_header(False)
+        out_f.write(json.dumps(header, ensure_ascii=False) + "\n")
         for i, row in enumerate(rows):
             try:
                 out_row = process_row(row, config, drop_prob, i + 1)

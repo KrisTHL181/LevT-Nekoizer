@@ -6,6 +6,10 @@ using a HuggingFace tokenizer. The output is ready for consumption
 by the LevT training pipeline (which expects ``src``, ``target``,
 and optionally ``initial`` as integer token ID lists).
 
+The output file begins with a ``{"__meta__": {"format": "levt-jsonl",
+"version": 1, "packed": false}}`` header marking it as a regular
+dataset, so training auto-detects it.
+
 Usage::
 
     python scripts/pre_tokenize.py tokenizer_config.json input.jsonl output.jsonl
@@ -19,6 +23,11 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO
+
+# Make the repo root importable when run as ``python scripts/pre_tokenize.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from levt.dataset_meta import META_KEY, dataset_header
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -267,6 +276,8 @@ def read_jsonl(infile: TextIO) -> List[Dict[str, Any]]:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if raw_line_num == 1 and META_KEY in row:
+            continue  # skip the dataset metadata header
         rows.append(row)
         line_numbers.append(raw_line_num)
     return rows
@@ -356,6 +367,8 @@ def main() -> None:
     output_path = Path(args.output)
     written = 0
     with open(output_path, "w", encoding="utf-8") as out_f:
+        # The tokenized output is a regular (unpacked) dataset.
+        out_f.write(json.dumps(dataset_header(False), ensure_ascii=False) + "\n")
         for i, row in enumerate(rows):
             line_display = i + 1  # 1-based for error messages
 

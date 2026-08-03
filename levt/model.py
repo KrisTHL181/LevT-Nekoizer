@@ -153,7 +153,8 @@ class MultiheadAttention(nn.Module):
         Args:
             query, key, value: (seq_len, batch, embed_dim)
             key_padding_mask:  (batch, seq_len)  True = pad / ignore
-            attn_mask:         additional mask (reserved, not used by LevT)
+            attn_mask:         additional mask; bool (True = attend) or float
+                               additive.  Used as the packed-segment mask.
             position_offset:   for RoPE, starting position index (default 0)
 
         Returns:
@@ -277,8 +278,12 @@ class MultiheadAttention(nn.Module):
             else:
                 mask = mask + alibi_bias
 
-        # 3. User-supplied mask (unused in default LevT)
+        # 3. User-supplied mask (used for packed-segment self/cross masks).
+        #    A bool mask means True = attend; convert to a float additive
+        #    mask so it can be summed with the padding mask above.
         if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                attn_mask = torch.where(attn_mask, 0.0, float("-inf")).to(dtype)
             mask = attn_mask if mask is None else mask + attn_mask
 
         return mask
@@ -375,10 +380,13 @@ class TransformerEncoderLayer(nn.Module):
 
     def forward(
         self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
-        x2, _ = self.self_attn(x, x, x, key_padding_mask=key_padding_mask)
+        x2, _ = self.self_attn(
+            x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_mask,
+        )
         x = residual + self.dropout(x2)
         residual = x
         x = self.norm2(x)
@@ -413,9 +421,10 @@ class TransformerEncoder(nn.Module):
 
     def forward(
         self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, key_padding_mask)
+            x = layer(x, key_padding_mask, attn_mask)
         return self.norm(x)
 
 
@@ -462,16 +471,24 @@ class LevTDecoderLayer(nn.Module):
         memory: torch.Tensor,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_attn_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Bidirectional self-attention
         residual = tgt
         tgt = self.norm1(tgt)
-        tgt2, _ = self.self_attn(tgt, tgt, tgt, key_padding_mask=tgt_key_padding_mask)
+        tgt2, _ = self.self_attn(
+            tgt, tgt, tgt,
+            key_padding_mask=tgt_key_padding_mask, attn_mask=tgt_attn_mask,
+        )
         tgt = residual + self.dropout(tgt2)
         # Cross-attention to encoder memory
         residual = tgt
         tgt = self.norm2(tgt)
-        tgt2, _ = self.cross_attn(tgt, memory, memory, key_padding_mask=memory_key_padding_mask)
+        tgt2, _ = self.cross_attn(
+            tgt, memory, memory,
+            key_padding_mask=memory_key_padding_mask, attn_mask=cross_attn_mask,
+        )
         tgt = residual + self.dropout(tgt2)
         # Feed-forward
         residual = tgt
@@ -511,10 +528,15 @@ class LevTDecoder(nn.Module):
         memory: torch.Tensor,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_attn_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         outputs: List[torch.Tensor] = []
         for layer in self.layers:
-            tgt = layer(tgt, memory, tgt_key_padding_mask, memory_key_padding_mask)
+            tgt = layer(
+                tgt, memory, tgt_key_padding_mask, memory_key_padding_mask,
+                tgt_attn_mask, cross_attn_mask,
+            )
             outputs.append(self.norm(tgt))
         return outputs
 
@@ -647,18 +669,24 @@ class LevTModel(nn.Module):
         return_deletion: bool = True,
         return_placeholder: bool = True,
         return_token: bool = True,
+        attn_mask: Optional[torch.Tensor] = None,
+        tgt_attn_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ):
         # Encode source
         src_emb = self._add_pos(
             self.encoder_input_projection(self.shared_embedding(src_tokens)), self.src_pos,
         )
-        memory = self.encoder(src_emb, src_padding_mask)
+        memory = self.encoder(src_emb, src_padding_mask, attn_mask)
 
         # Decode target — get all layer outputs
         tgt_emb = self._add_pos(
             self.decoder_input_projection(self.shared_embedding(prev_output_tokens)), self.tgt_pos,
         )
-        decoder_outputs = self.decoder(tgt_emb, memory, tgt_padding_mask, src_padding_mask)
+        decoder_outputs = self.decoder(
+            tgt_emb, memory, tgt_padding_mask, src_padding_mask,
+            tgt_attn_mask, cross_attn_mask,
+        )
 
         result = {}
         if return_deletion:
@@ -680,12 +708,13 @@ class LevTModel(nn.Module):
     def encode(
         self, src_tokens: torch.Tensor,
         src_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode source once (reused across decoding iterations)."""
         src_emb = self._add_pos(
             self.encoder_input_projection(self.shared_embedding(src_tokens)), self.src_pos,
         )
-        return self.encoder(src_emb, src_padding_mask)
+        return self.encoder(src_emb, src_padding_mask, attn_mask)
 
     def decode_with_memory(
         self,
@@ -697,12 +726,17 @@ class LevTModel(nn.Module):
         return_placeholder: bool = True,
         return_token: bool = True,
         token_positions: Optional[torch.Tensor] = None,
+        tgt_attn_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ):
         """Decode memory and return requested heads (all heads by default)."""
         tgt_emb = self._add_pos(
             self.decoder_input_projection(self.shared_embedding(prev_output_tokens)), self.tgt_pos,
         )
-        decoder_outputs = self.decoder(tgt_emb, memory, tgt_padding_mask, src_padding_mask)
+        decoder_outputs = self.decoder(
+            tgt_emb, memory, tgt_padding_mask, src_padding_mask,
+            tgt_attn_mask, cross_attn_mask,
+        )
         result = {}
         if return_deletion:
             result["del_logits"] = self.deletion_head(decoder_outputs[self._del_layer])

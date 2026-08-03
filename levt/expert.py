@@ -13,7 +13,7 @@ Reference: "Levenshtein Transformer" (Gu et al., NeurIPS 2019), Sections 2-3.
 from __future__ import annotations
 
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -189,23 +189,31 @@ def _levenshtein_align_py(
 # Oracle policies
 # ---------------------------------------------------------------------------
 
-def oracle_deletion(
+def _segment_sequences(
     y: torch.Tensor,
-    y_star: torch.Tensor,
-    bos_idx: int = 1,
-    eos_idx: int = 2,
-) -> torch.Tensor:
-    """
-    Oracle deletion policy: compute optimal tokens to delete from y.
+    bos_idx: int,
+    eos_idx: int,
+) -> List[torch.Tensor]:
+    """Split a packed sequence into segments at ``[EOS][BOS]`` boundaries.
 
-    Args:
-        y:      current sequence (with BOS, EOS), shape (L,)
-        y_star: target sequence (with BOS, EOS), shape (M,)
-
-    Returns:
-        mask: boolean tensor of shape (L,), True = DELETE this token.
-              Boundaries (BOS/EOS) are always False (never deleted).
+    Returns *views* (no copy).  A single-segment (unpacked) sequence yields
+    ``[y]`` unchanged, so segmentation is a no-op for unpacked data.  The
+    segmenting keeps the oracles from ever editing across a segment boundary,
+    which preserves the segment count of packed roll-ins.
     """
+    if y.numel() < 2:
+        return [y]
+    boundary = (y[:-1] == eos_idx) & (y[1:] == bos_idx)
+    if not boundary.any():
+        return [y]
+    cuts = (boundary.nonzero().flatten() + 1).tolist()
+    starts = [0] + cuts
+    ends = cuts + [len(y)]
+    return [y[s:e] for s, e in zip(starts, ends)]
+
+
+def _deletion_mask(y: torch.Tensor, y_star: torch.Tensor) -> torch.Tensor:
+    """Core deletion oracle on one sequence (whole-sequence DP)."""
     deletions, _ = levenshtein_align(y, y_star)
     mask = torch.zeros(len(y), dtype=torch.bool)
     if deletions.numel() > 0:
@@ -216,25 +224,44 @@ def oracle_deletion(
     return mask
 
 
-def oracle_insertion(
+def oracle_deletion(
     y: torch.Tensor,
     y_star: torch.Tensor,
-    max_placeholder: int = 255,
-    plh_token_id: int = 3,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    bos_idx: int = 1,
+    eos_idx: int = 2,
+) -> torch.Tensor:
     """
-    Oracle insertion policy: compute optimal placeholders and tokens.
+    Oracle deletion policy: compute optimal tokens to delete from y.
+
+    For packed sequences (multiple ``[BOS]...[EOS]`` segments), the DP runs
+    independently on each segment so no interior segment boundary is ever
+    deleted and the roll-in keeps its segment count.  Unpacked sequences are
+    unchanged (one segment).
 
     Args:
-        y:                current sequence (with BOS, EOS), shape (L,)
-        y_star:           target sequence (with BOS, EOS), shape (M,)
-        max_placeholder:  K_max — cap on placeholders per slot
-        plh_token_id:     id of <PLH> token
+        y:      current sequence (with BOS, EOS), shape (L,)
+        y_star: target sequence (with BOS, EOS), shape (M,)
 
     Returns:
-        p_star: (L-1,) long tensor — number of placeholders for each gap
-        t_star: (total_plh,) long tensor — flattened token ids, in gap order
+        mask: boolean tensor of shape (L,), True = DELETE this token.
+              Boundaries (BOS/EOS) are always False (never deleted).
     """
+    segs_y = _segment_sequences(y, bos_idx, eos_idx)
+    segs_s = _segment_sequences(y_star, bos_idx, eos_idx)
+    if len(segs_y) > 1 and len(segs_y) == len(segs_s):
+        return torch.cat([
+            _deletion_mask(sy, ss) for sy, ss in zip(segs_y, segs_s)
+        ])
+    return _deletion_mask(y, y_star)
+
+
+def _insertion_oracle(
+    y: torch.Tensor,
+    y_star: torch.Tensor,
+    max_placeholder: int,
+    plh_token_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Core insertion oracle on one sequence (whole-sequence DP)."""
     deletions, insertions = levenshtein_align(y, y_star)
 
     # Build surviving mask (tokens NOT deleted)
@@ -266,6 +293,50 @@ def oracle_insertion(
     return p_star, t_star
 
 
+def oracle_insertion(
+    y: torch.Tensor,
+    y_star: torch.Tensor,
+    max_placeholder: int = 255,
+    plh_token_id: int = 3,
+    bos_idx: int = 1,
+    eos_idx: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Oracle insertion policy: compute optimal placeholders and tokens.
+
+    For packed sequences the DP runs per segment and a zero-insertion gap is
+    forced at every segment boundary, so the edit script never crosses an
+    ``[EOS][BOS]`` boundary.  Unpacked sequences are unchanged (one segment).
+
+    Args:
+        y:                current sequence (with BOS, EOS), shape (L,)
+        y_star:           target sequence (with BOS, EOS), shape (M,)
+        max_placeholder:  K_max — cap on placeholders per slot
+        plh_token_id:     id of <PLH> token
+
+    Returns:
+        p_star: (L-1,) long tensor — number of placeholders for each gap
+        t_star: (total_plh,) long tensor — flattened token ids, in gap order
+    """
+    segs_y = _segment_sequences(y, bos_idx, eos_idx)
+    segs_s = _segment_sequences(y_star, bos_idx, eos_idx)
+    if len(segs_y) > 1 and len(segs_y) == len(segs_s):
+        p_parts: List[torch.Tensor] = []
+        t_parts: List[torch.Tensor] = []
+        for sy, ss in zip(segs_y, segs_s):
+            p, t = _insertion_oracle(sy, ss, max_placeholder, plh_token_id)
+            p_parts.append(p)
+            t_parts.append(t)
+        # Interleave a zero gap between segments (no cross-boundary insert).
+        full_parts: List[torch.Tensor] = []
+        for index, p in enumerate(p_parts):
+            full_parts.append(p)
+            if index < len(p_parts) - 1:
+                full_parts.append(torch.zeros(1, dtype=p.dtype, device=p.device))
+        return torch.cat(full_parts), torch.cat(t_parts)
+    return _insertion_oracle(y, y_star, max_placeholder, plh_token_id)
+
+
 def _slice_packed(packed: torch.Tensor, offsets: torch.Tensor) -> List[torch.Tensor]:
     """Split a packed flat tensor into per-sample tensors using [B+1] offsets."""
     offsets_list = offsets.tolist()
@@ -278,22 +349,55 @@ def _slice_packed(packed: torch.Tensor, offsets: torch.Tensor) -> List[torch.Ten
 def oracle_deletion_batch(
     ys: List[torch.Tensor],
     ys_stars: List[torch.Tensor],
+    bos_idx: int = 1,
+    eos_idx: int = 2,
 ) -> List[torch.Tensor]:
     """
     Batched oracle deletion policy (one C++ call for the whole batch).
 
-    Returns a list with one bool mask (True = DELETE) per input pair, each of
-    length ``len(y)`` with boundaries forced ``False`` — identical to
+    Packed sequences are split into segments first so the DP never crosses an
+    ``[EOS][BOS]`` boundary; segment masks are re-concatenated per sample.
+    Returns one bool mask (True = DELETE) per input pair, each of length
+    ``len(y)`` with boundaries forced ``False`` — identical to
     ``[oracle_deletion(y, ys_) for y, ys_ in zip(ys, ys_stars)]``.
 
     Falls back to per-sample calls when the C++ extension is unavailable.
     """
+    flat_ys: List[torch.Tensor] = []
+    flat_stars: List[torch.Tensor] = []
+    spans: List[Optional[Tuple[int, int]]] = []
+    for y, ys_ in zip(ys, ys_stars):
+        segs_y = _segment_sequences(y, bos_idx, eos_idx)
+        segs_s = _segment_sequences(ys_, bos_idx, eos_idx)
+        if len(segs_y) > 1 and len(segs_y) == len(segs_s):
+            start = len(flat_ys)
+            flat_ys.extend(segs_y)
+            flat_stars.extend(segs_s)
+            spans.append((start, len(flat_ys)))
+        else:
+            spans.append(None)  # single-segment or mismatched boundaries
+            flat_ys.append(y)
+            flat_stars.append(ys_)
     if levenshtein_deletion_cpp_batch is not None:
-        result = levenshtein_deletion_cpp_batch(ys, ys_stars)
+        result = levenshtein_deletion_cpp_batch(flat_ys, flat_stars)
         if result is not None:
             del_packed, offsets = result
-            return [mask.bool() for mask in _slice_packed(del_packed, offsets)]
-    return [oracle_deletion(y, ys_) for y, ys_ in zip(ys, ys_stars)]
+            masks = [mask.bool() for mask in _slice_packed(del_packed, offsets)]
+            out: List[torch.Tensor] = []
+            k = 0
+            for span in spans:
+                if span is None:
+                    out.append(masks[k])
+                    k += 1
+                else:
+                    _, end = span
+                    out.append(torch.cat(masks[k:end]))
+                    k = end
+            return out
+    return [
+        oracle_deletion(y, ys_, bos_idx=bos_idx, eos_idx=eos_idx)
+        for y, ys_ in zip(ys, ys_stars)
+    ]
 
 
 def oracle_insertion_batch(
@@ -301,35 +405,79 @@ def oracle_insertion_batch(
     ys_stars: List[torch.Tensor],
     max_placeholder: int = 255,
     plh_token_id: int = 3,
+    bos_idx: int = 1,
+    eos_idx: int = 2,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
     """
     Batched oracle insertion policy (one C++ call for the whole batch).
 
-    Returns ``(p_stars, t_stars, y_ins_plhs)`` — parallel per-sample lists
-    matching ``[oracle_insertion(...) ...]`` plus the PLH-interleaved roll-in
-    ``insert_placeholders(y, p_star)``. The three lists are aligned with
-    ``ys`` (sample ``i`` of each list belongs to pair ``i``).
+    Packed sequences are split into segments first so the edit script never
+    crosses an ``[EOS][BOS]`` boundary; a zero-insertion gap is forced at each
+    segment boundary.  Returns ``(p_stars, t_stars, y_ins_plhs)`` — parallel
+    per-sample lists matching ``[oracle_insertion(...) ...]`` plus the
+    PLH-interleaved roll-in ``insert_placeholders(y, p_star)``. The three
+    lists are aligned with ``ys`` (sample ``i`` of each list belongs to pair
+    ``i``).
 
     Falls back to per-sample calls when the C++ extension is unavailable.
     """
+    flat_ys: List[torch.Tensor] = []
+    flat_stars: List[torch.Tensor] = []
+    spans: List[Optional[Tuple[int, int]]] = []
+    for y, ys_ in zip(ys, ys_stars):
+        segs_y = _segment_sequences(y, bos_idx, eos_idx)
+        segs_s = _segment_sequences(ys_, bos_idx, eos_idx)
+        if len(segs_y) > 1 and len(segs_y) == len(segs_s):
+            start = len(flat_ys)
+            flat_ys.extend(segs_y)
+            flat_stars.extend(segs_s)
+            spans.append((start, len(flat_ys)))
+        else:
+            spans.append(None)  # single-segment or mismatched boundaries
+            flat_ys.append(y)
+            flat_stars.append(ys_)
     if levenshtein_insertion_cpp_batch is not None:
         result = levenshtein_insertion_cpp_batch(
-            ys, ys_stars, max_placeholder, plh_token_id,
+            flat_ys, flat_stars, max_placeholder, plh_token_id,
         )
         if result is not None:
             (p_packed, p_offsets, t_packed, t_offsets,
              plh_packed, plh_offsets) = result
-            return (
-                _slice_packed(p_packed, p_offsets),
-                _slice_packed(t_packed, t_offsets),
-                _slice_packed(plh_packed, plh_offsets),
-            )
-    p_stars: List[torch.Tensor] = []
-    t_stars: List[torch.Tensor] = []
-    y_ins_plhs: List[torch.Tensor] = []
+            p_segs = _slice_packed(p_packed, p_offsets)
+            t_segs = _slice_packed(t_packed, t_offsets)
+            plh_segs = _slice_packed(plh_packed, plh_offsets)
+            p_stars: List[torch.Tensor] = []
+            t_stars: List[torch.Tensor] = []
+            y_ins_plhs: List[torch.Tensor] = []
+            k = 0
+            for span in spans:
+                if span is None:
+                    p_stars.append(p_segs[k])
+                    t_stars.append(t_segs[k])
+                    y_ins_plhs.append(plh_segs[k])
+                    k += 1
+                else:
+                    _, end = span
+                    parts: List[torch.Tensor] = []
+                    for index, p in enumerate(p_segs[k:end]):
+                        parts.append(p)
+                        if index < (end - k) - 1:
+                            parts.append(torch.zeros(
+                                1, dtype=p.dtype, device=p.device,
+                            ))
+                    p_stars.append(torch.cat(parts))
+                    t_stars.append(torch.cat(t_segs[k:end]))
+                    y_ins_plhs.append(torch.cat(plh_segs[k:end]))
+                    k = end
+            return p_stars, t_stars, y_ins_plhs
+    p_stars = []
+    t_stars = []
+    y_ins_plhs = []
     for y, ys_ in zip(ys, ys_stars):
         p_star, t_star = oracle_insertion(
-            y, ys_, max_placeholder=max_placeholder, plh_token_id=plh_token_id,
+            y, ys_,
+            max_placeholder=max_placeholder, plh_token_id=plh_token_id,
+            bos_idx=bos_idx, eos_idx=eos_idx,
         )
         p_stars.append(p_star)
         t_stars.append(t_star)
@@ -422,12 +570,12 @@ def random_deletion(
         sequence with randomly deleted tokens removed
     """
     y_list = y_star.tolist()
-    # Keep BOS, EOS, and drop others with probability drop_prob
+    # Keep BOS, EOS, and drop others with probability drop_prob.  Every BOS/EOS
+    # is kept (not just the first/last) so packed rows never lose an interior
+    # segment boundary.
     keep: List[int] = []
     for idx, tok in enumerate(y_list):
-        if idx == 0:  # BOS
-            keep.append(tok)
-        elif idx == len(y_list) - 1:  # EOS
+        if tok == bos_idx or tok == eos_idx:
             keep.append(tok)
         elif tok == pad_idx:
             continue

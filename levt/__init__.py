@@ -14,6 +14,12 @@ Reference: "Levenshtein Transformer" (Gu, Wang, Zhao, NeurIPS 2019)
 
 from .config import LevTConfig, PolicyConfig, TrainConfig
 from .data import JsonlDataset, LevTCollator, validate_record
+from .dataset_meta import (
+    DatasetMetadata,
+    dataset_header,
+    parse_metadata_line,
+    read_dataset_metadata,
+)
 from .embeddings import import_hf_embeddings, load_hf_embedding_weights
 from .checkpoint import load_checkpoint, save_checkpoint
 from .positional import (
@@ -53,6 +59,10 @@ __all__ = [
     "JsonlDataset",
     "LevTCollator",
     "validate_record",
+    "DatasetMetadata",
+    "dataset_header",
+    "parse_metadata_line",
+    "read_dataset_metadata",
     "import_hf_embeddings",
     "load_hf_embedding_weights",
     "save_checkpoint",

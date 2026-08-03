@@ -227,6 +227,8 @@ class TrainConfig:
     oracle_batch_size: int = 0
     num_workers: int = 0
     prefetch_maxsize: int = 5
+    # Legacy fallback for header-less dataset files.  A file's own
+    # {"__meta__": {"packed": ...}} header wins whenever it is present.
     packed: bool = False
     max_source_length: int = 1024
     max_target_length: int = 1024

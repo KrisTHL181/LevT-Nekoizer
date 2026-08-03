@@ -19,9 +19,10 @@ is the longer of its two sequences).
 Output rows (one per bin):
     {"src": [...], "target": [...], "initial": [...], "n_segments": k}
 
-Packed rows contain interior BOS/EOS boundary tokens, so training must set the
-``packed`` flag in ``train_config.json`` (relaxes the interior-boundary check).
-``n_segments`` is metadata for stats; the training pipeline ignores it.
+Packed rows contain interior BOS/EOS boundary tokens.  The output file begins
+with a ``{"__meta__": {"format": "levt-jsonl", "version": 1, "packed": true}}``
+header line so training auto-detects the packed format.  ``n_segments`` is
+metadata for stats; the training pipeline ignores it.
 
 The packing core is vectorised with numpy because a naive Python first-fit
 scan is O(examples x bins) — intractable for ~10^6 examples.
@@ -37,9 +38,15 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# Make the repo root importable when run as ``python scripts/pack_dataset.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from levt.dataset_meta import META_KEY, dataset_header
 
 
 def _load_sizes(
@@ -61,6 +68,8 @@ def _load_sizes(
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_no}: invalid JSON: {exc.msg}") from exc
+            if line_no == 1 and isinstance(record, dict) and META_KEY in record:
+                continue  # skip the dataset metadata header
             if not isinstance(record, dict) or "src" not in record or "target" not in record:
                 raise ValueError(f"{path}:{line_no}: missing src/target")
             src = record["src"]
@@ -144,13 +153,14 @@ def _rebuild_and_write(
         [] for _ in range(n_bins)
     ]
     total_tokens = 0
+    data_index = 0
     with path.open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, 1):
-            if limit and line_no > limit:
-                break
             if not line.strip():
                 continue
             record = json.loads(line)
+            if line_no == 1 and META_KEY in record:
+                continue  # skip the dataset metadata header
             src: list[int] = record["src"]
             target: list[int] = record["target"]
             initial: list[int] = record.get("initial", [bos, eos])
@@ -160,12 +170,16 @@ def _rebuild_and_write(
                 )
             if len(initial) > tgt_cap:
                 raise ValueError(f"{path}:{line_no}: initial exceeds target capacity")
-            bins_data[int(bin_of_item[line_no - 1])].append((src, target, initial))
+            bins_data[int(bin_of_item[data_index])].append((src, target, initial))
             total_tokens += len(src) + len(target)
+            data_index += 1
+            if limit and data_index >= limit:
+                break
 
     n_segments: list[int] = []
     written = 0
     with output.open("w", encoding="utf-8") as out:
+        out.write(json.dumps(dataset_header(True), ensure_ascii=False) + "\n")
         for b in range(n_bins):
             items = bins_data[b]
             n_segments.append(len(items))

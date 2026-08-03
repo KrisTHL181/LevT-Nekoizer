@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .config import LevTConfig
+from .dataset_meta import DatasetMetadata, parse_metadata_line
 
 
 def _validate_token_list(
@@ -155,7 +156,15 @@ def validate_record(
 
 
 class JsonlDataset(Dataset):
-    """In-memory validated JSONL rows with ``src``, ``target``, and ``initial``."""
+    """In-memory validated JSONL rows with ``src``, ``target``, and ``initial``.
+
+    If the file's first line is a ``{"__meta__": {...}}`` header, its
+    ``packed`` flag is authoritative and the line is skipped (not validated
+    as a data row).  Files without a header are treated as legacy regular
+    datasets, falling back to the explicit ``allow_interior_boundaries``
+    argument (which defaults to ``False``).  The resolved value is exposed
+    as :attr:`packed` so callers (e.g. the collator) stay consistent.
+    """
 
     def __init__(
         self,
@@ -164,14 +173,37 @@ class JsonlDataset(Dataset):
         *,
         max_source_length: int,
         max_target_length: int,
-        allow_interior_boundaries: bool = False,
+        allow_interior_boundaries: Optional[bool] = None,
     ) -> None:
         self.path = Path(path)
         self.config = config
         self.rows: List[Dict[str, List[int]]] = []
+        metadata: Optional[DatasetMetadata] = None
         try:
             with self.path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, 1):
+                first_line = handle.readline()
+                if not first_line:
+                    raise ValueError(f"{self.path}: dataset is empty")
+                if not first_line.strip():
+                    raise ValueError(f"{self.path}:1: blank lines are not allowed")
+                try:
+                    first_row = json.loads(first_line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{self.path}:1: invalid JSON: {exc.msg}") from exc
+                metadata = parse_metadata_line(first_row, source=f"{self.path}:1")
+                # The file's own metadata wins; the explicit argument is only
+                # a fallback for legacy files that have no header.
+                packed = metadata.packed if metadata is not None else bool(allow_interior_boundaries)
+                if metadata is None:
+                    self.rows.append(validate_record(
+                        first_row, config,
+                        max_source_length=max_source_length,
+                        max_target_length=max_target_length,
+                        max_placeholder=config.max_placeholder,
+                        source=f"{self.path}:1",
+                        allow_interior_boundaries=packed,
+                    ))
+                for line_number, line in enumerate(handle, 2):
                     if not line.strip():
                         raise ValueError(f"{self.path}:{line_number}: blank lines are not allowed")
                     try:
@@ -184,12 +216,14 @@ class JsonlDataset(Dataset):
                         max_target_length=max_target_length,
                         max_placeholder=config.max_placeholder,
                         source=f"{self.path}:{line_number}",
-                        allow_interior_boundaries=allow_interior_boundaries,
+                        allow_interior_boundaries=packed,
                     ))
         except OSError as exc:
             raise ValueError(f"failed to read {self.path}: {exc}") from exc
         if not self.rows:
             raise ValueError(f"{self.path}: dataset is empty")
+        self.packed = packed
+        self.has_header = metadata is not None
 
     def __len__(self) -> int:
         return len(self.rows)

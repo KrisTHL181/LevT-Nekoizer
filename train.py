@@ -117,6 +117,7 @@ def make_loader(
     shuffle: bool,
     shuffle_seed: Optional[int] = None,
     resume_batch_index: int = 0,
+    verbose: bool = False,
 ) -> DataLoader:
     dataset = JsonlDataset(
         path, model_cfg,
@@ -124,11 +125,17 @@ def make_loader(
         max_target_length=train_cfg.max_target_length,
         allow_interior_boundaries=train_cfg.packed,
     )
+    if verbose:
+        mode = "packed" if dataset.packed else "regular"
+        origin = "dataset header" if dataset.has_header else "config fallback"
+        print(f"[data] {path}: {mode} dataset ({origin})", flush=True)
+    # Keep the collator's boundary check consistent with whatever the
+    # dataset resolved (its own metadata header wins over the config flag).
     collator = LevTCollator(
         model_cfg,
         max_source_length=train_cfg.max_source_length,
         max_target_length=train_cfg.max_target_length,
-        allow_interior_boundaries=train_cfg.packed,
+        allow_interior_boundaries=dataset.packed,
     )
     generator = None
     sampler = None
@@ -419,7 +426,10 @@ def main() -> None:
     _check_cpp_extension()
 
     validation_loader = (
-        make_loader(train_cfg.validation_data, model_cfg, train_cfg, shuffle=False)
+        make_loader(
+            train_cfg.validation_data, model_cfg, train_cfg,
+            shuffle=False, verbose=True,
+        )
         if train_cfg.validation_data else None
     )
 
@@ -545,6 +555,7 @@ def main() -> None:
             shuffle=True,
             shuffle_seed=train_cfg.seed + epoch,
             resume_batch_index=resume_batch_index,
+            verbose=True,
         )
         if len(train_loader) == 0:
             # The sampler consumed all batches in this epoch — advance.

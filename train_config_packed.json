@@ -6,7 +6,6 @@
   "oracle_batch_size": 0,
   "num_workers": 0,
   "prefetch_maxsize": 5,
-  "packed": true,
   "max_source_length": 1024,
   "max_target_length": 1024,
   "local_files_only": false,
