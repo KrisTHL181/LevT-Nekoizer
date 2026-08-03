@@ -277,6 +277,20 @@ torch::Tensor offsets_tensor(const std::vector<int64_t>& lengths) {
     return vector_to_tensor(off, torch::kInt64);
 }
 
+// Copy a tensor's int64 payload into a plain std::vector.  Must be called
+// while holding the GIL; the resulting vector is owned entirely by this scope
+// and can be safely read inside a `py::gil_scoped_release` region.
+std::vector<int64_t> tensor_to_vector(const torch::Tensor& t) {
+    const int64_t n = t.numel();
+    std::vector<int64_t> v;
+    v.reserve(static_cast<size_t>(n));
+    if (n > 0) {
+        const int64_t* p = t.const_data_ptr<int64_t>();
+        v.assign(p, p + n);
+    }
+    return v;
+}
+
 }  // anonymous namespace
 
 
@@ -285,11 +299,19 @@ levenshtein_align(torch::Tensor y, torch::Tensor y_star) {
     y = coerce_int64_cpu(std::move(y));
     y_star = coerce_int64_cpu(std::move(y_star));
 
-    const int n = static_cast<int>(y.size(0));
-    const int m = static_cast<int>(y_star.size(0));
+    // Copy the inputs into plain vectors while holding the GIL so the DP /
+    // backtrack compute below can run with the GIL released (no tensor access
+    // inside the release region).
+    std::vector<int64_t> yv = tensor_to_vector(y);
+    std::vector<int64_t> y_star_v = tensor_to_vector(y_star);
+    const int n = static_cast<int>(yv.size());
+    const int m = static_cast<int>(y_star_v.size());
 
-    RawAlign ra = align_one_raw(y.const_data_ptr<int64_t>(), n,
-                                y_star.const_data_ptr<int64_t>(), m);
+    RawAlign ra;
+    {
+        py::gil_scoped_release release;
+        ra = align_one_raw(yv.data(), n, y_star_v.data(), m);
+    }
 
     auto deletions_tensor = vector_to_tensor(ra.deletions, torch::kInt64);
     std::vector<torch::Tensor> per_gap;
@@ -315,26 +337,46 @@ levenshtein_deletion_batch(std::vector<torch::Tensor> ys,
             "levenshtein_deletion_batch: list length mismatch");
     }
     const size_t B = ys.size();
-    std::vector<std::vector<uint8_t>> masks(B);
-    std::vector<int64_t> lengths(B);
 
+    // Copy every sample's payload into plain vectors while holding the GIL.
+    // The per-sample alignment + mask packing below runs with the GIL
+    // released, so it must not touch any torch::Tensor.
+    std::vector<std::vector<int64_t>> ys_v(B), ys_stars_v(B);
     for (size_t i = 0; i < B; ++i) {
         torch::Tensor y = coerce_int64_cpu(std::move(ys[i]));
         torch::Tensor y_star = coerce_int64_cpu(std::move(ys_stars[i]));
-        const int n = static_cast<int>(y.size(0));
-        const int m = static_cast<int>(y_star.size(0));
+        ys_v[i] = tensor_to_vector(y);
+        ys_stars_v[i] = tensor_to_vector(y_star);
+    }
 
-        RawAlign ra = align_one_raw(y.const_data_ptr<int64_t>(), n,
-                                    y_star.const_data_ptr<int64_t>(), m);
+    std::vector<std::vector<uint8_t>> masks(B);
+    std::vector<int64_t> lengths(B);
 
-        std::vector<uint8_t>& mask = masks[i];
-        mask.assign(static_cast<size_t>(n), 0);   // default: keep
-        for (int64_t d : ra.deletions) {
-            mask[static_cast<size_t>(d)] = 1;      // mark delete
+    {
+        py::gil_scoped_release release;
+        // Each iteration writes only to masks[i]/lengths[i], so the batch is
+        // embarrassingly parallel.  `#pragma omp parallel for` is a no-op
+        // unless the loader compiles with -fopenmp; the `if` clause keeps
+        // small batches serial to avoid thread-team overhead.
+#ifdef _OPENMP
+#pragma omp parallel for if (B >= 8) schedule(static)
+#endif
+        for (size_t i = 0; i < B; ++i) {
+            const int n = static_cast<int>(ys_v[i].size());
+            const int m = static_cast<int>(ys_stars_v[i].size());
+
+            RawAlign ra = align_one_raw(ys_v[i].data(), n,
+                                        ys_stars_v[i].data(), m);
+
+            std::vector<uint8_t>& mask = masks[i];
+            mask.assign(static_cast<size_t>(n), 0);   // default: keep
+            for (int64_t d : ra.deletions) {
+                mask[static_cast<size_t>(d)] = 1;      // mark delete
+            }
+            if (n > 0) mask[0] = 0;                    // never delete BOS
+            if (n > 1) mask[static_cast<size_t>(n - 1)] = 0;  // never delete EOS
+            lengths[i] = n;
         }
-        if (n > 0) mask[0] = 0;                    // never delete BOS
-        if (n > 1) mask[static_cast<size_t>(n - 1)] = 0;  // never delete EOS
-        lengths[i] = n;
     }
 
     auto packed = concat_to_tensor(masks, torch::kUInt8);
@@ -363,56 +405,76 @@ levenshtein_insertion_batch(std::vector<torch::Tensor> ys,
             "levenshtein_insertion_batch: list length mismatch");
     }
     const size_t B = ys.size();
-    std::vector<std::vector<int64_t>> p_stars(B), t_stars(B), y_ins_plhs(B);
-    std::vector<int64_t> p_lens(B), t_lens(B), plh_lens(B);
 
+    // Copy every sample's payload into plain vectors while holding the GIL.
+    // The per-sample alignment + oracle construction below runs with the GIL
+    // released, so it must not touch any torch::Tensor.
+    std::vector<std::vector<int64_t>> ys_v(B), ys_stars_v(B);
     for (size_t i = 0; i < B; ++i) {
         torch::Tensor y = coerce_int64_cpu(std::move(ys[i]));
         torch::Tensor y_star = coerce_int64_cpu(std::move(ys_stars[i]));
-        const int n = static_cast<int>(y.size(0));
-        if (n < 1) {
+        if (y.numel() < 1) {
             throw std::invalid_argument(
                 "levenshtein_insertion_batch: y must be non-empty");
         }
-        const int m = static_cast<int>(y_star.size(0));
-        const int64_t* y_ptr = y.const_data_ptr<int64_t>();
+        ys_v[i] = tensor_to_vector(y);
+        ys_stars_v[i] = tensor_to_vector(y_star);
+    }
 
-        RawAlign ra = align_one_raw(y_ptr, n, y_star.const_data_ptr<int64_t>(), m);
+    std::vector<std::vector<int64_t>> p_stars(B), t_stars(B), y_ins_plhs(B);
+    std::vector<int64_t> p_lens(B), t_lens(B), plh_lens(B);
 
-        std::vector<int64_t>& p_star = p_stars[i];
-        std::vector<int64_t>& t_star = t_stars[i];
-        std::vector<int64_t>& plh_out = y_ins_plhs[i];
+    {
+        py::gil_scoped_release release;
+        // Each iteration writes only to p_stars[i]/t_stars[i]/y_ins_plhs[i],
+        // so the batch is embarrassingly parallel.  `#pragma omp parallel for`
+        // is a no-op unless the loader compiles with -fopenmp; the `if` clause
+        // keeps small batches serial to avoid thread-team overhead.
+#ifdef _OPENMP
+#pragma omp parallel for if (B >= 8) schedule(static)
+#endif
+        for (size_t i = 0; i < B; ++i) {
+            const int n = static_cast<int>(ys_v[i].size());
+            const int m = static_cast<int>(ys_stars_v[i].size());
+            const int64_t* y_ptr = ys_v[i].data();
 
-        // p_star: placeholder count per gap, anchored at surviving[g].
-        // surviving[num_gaps-1] is the second-to-last survivor, so the index
-        // stays within [0, n-2] (last survivor = right boundary, never anchor).
-        p_star.assign(static_cast<size_t>(n - 1), 0);
-        const size_t num_gaps = ra.per_gap.size();
-        for (size_t g = 0; g < num_gaps; ++g) {
-            const size_t cnt = ra.per_gap[g].size();
-            const int64_t capped = static_cast<int64_t>(
-                std::min<size_t>(cnt, static_cast<size_t>(max_placeholder)));
-            const int anchor = ra.surviving[g];
-            p_star[static_cast<size_t>(anchor)] = capped;
-            for (size_t k = 0; k < static_cast<size_t>(capped); ++k) {
-                t_star.push_back(ra.per_gap[g][k]);
+            RawAlign ra = align_one_raw(y_ptr, n, ys_stars_v[i].data(), m);
+
+            std::vector<int64_t>& p_star = p_stars[i];
+            std::vector<int64_t>& t_star = t_stars[i];
+            std::vector<int64_t>& plh_out = y_ins_plhs[i];
+
+            // p_star: placeholder count per gap, anchored at surviving[g].
+            // surviving[num_gaps-1] is the second-to-last survivor, so the index
+            // stays within [0, n-2] (last survivor = right boundary, never anchor).
+            p_star.assign(static_cast<size_t>(n - 1), 0);
+            const size_t num_gaps = ra.per_gap.size();
+            for (size_t g = 0; g < num_gaps; ++g) {
+                const size_t cnt = ra.per_gap[g].size();
+                const int64_t capped = static_cast<int64_t>(
+                    std::min<size_t>(cnt, static_cast<size_t>(max_placeholder)));
+                const int anchor = ra.surviving[g];
+                p_star[static_cast<size_t>(anchor)] = capped;
+                for (size_t k = 0; k < static_cast<size_t>(capped); ++k) {
+                    t_star.push_back(ra.per_gap[g][k]);
+                }
             }
-        }
 
-        // y_ins_plh: y[pos], then p_star[pos] PLH tokens, then final token.
-        plh_out.reserve(static_cast<size_t>(n) + t_star.size());
-        for (int pos = 0; pos < n - 1; ++pos) {
-            plh_out.push_back(y_ptr[pos]);
-            const int64_t cnt = p_star[static_cast<size_t>(pos)];
-            for (int64_t k = 0; k < cnt; ++k) {
-                plh_out.push_back(plh_token_id);
+            // y_ins_plh: y[pos], then p_star[pos] PLH tokens, then final token.
+            plh_out.reserve(static_cast<size_t>(n) + t_star.size());
+            for (int pos = 0; pos < n - 1; ++pos) {
+                plh_out.push_back(y_ptr[pos]);
+                const int64_t cnt = p_star[static_cast<size_t>(pos)];
+                for (int64_t k = 0; k < cnt; ++k) {
+                    plh_out.push_back(plh_token_id);
+                }
             }
-        }
-        plh_out.push_back(y_ptr[n - 1]);
+            plh_out.push_back(y_ptr[n - 1]);
 
-        p_lens[i] = n - 1;
-        t_lens[i] = static_cast<int64_t>(t_star.size());
-        plh_lens[i] = static_cast<int64_t>(plh_out.size());
+            p_lens[i] = n - 1;
+            t_lens[i] = static_cast<int64_t>(t_star.size());
+            plh_lens[i] = static_cast<int64_t>(plh_out.size());
+        }
     }
 
     auto p_packed = concat_to_tensor(p_stars, torch::kInt64);

@@ -83,10 +83,21 @@ def _compile_and_load() -> Any:
             )
             return None
 
+        extra_cflags = ["-O3", "-march=native"]
+        extra_ldflags: list[str] = []
+        # Opt-in OpenMP for the per-sample batch loops.  The batch oracles are
+        # embarrassingly parallel over samples (24+ per step; 96 cores on the
+        # training box).  Gated behind an env var so a toolchain without libgomp
+        # is not silently pushed into the slower pure-Python fallback: with this
+        # off, the `#pragma omp` directives in the .cpp are compiled out.
+        if os.environ.get("NYALIZER_ORACLE_OMP"):
+            extra_cflags.append("-fopenmp")
+            extra_ldflags.append("-fopenmp")
         _module = load(
             name="_levt_levenshtein_ops",
             sources=[source_path],
-            extra_cflags=["-O3", "-march=native"],
+            extra_cflags=extra_cflags,
+            extra_ldflags=extra_ldflags,
             verbose=False,
         )
         _last_error = None
