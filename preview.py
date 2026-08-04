@@ -205,7 +205,7 @@ def _render_trace(
     start_tokens = trace[0][1]
     start_labels = _labels(start_tokens)
     lines.append(f"  {_DIM}start:{_RESET}  "
-                 f"{' '.join(_coloured_labels(start_tokens, start_labels, config, 'start'))}")
+                 f"{_coloured_labels(start_tokens, start_labels, config, 'start')}")
 
     phases = trace[1:]  # del, plh, fill, del, plh, fill, ...
     iteration = 0
