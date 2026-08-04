@@ -66,7 +66,8 @@ schema owning:
 ## Data
 
 JSONL rows use required `src` and `target`, plus optional `initial`. Missing
-`initial` becomes `[BOS, EOS]`; there is no `id` field. Lists must be nonempty
+`initial` defaults to the source sequence `src` (edit-task semantics: the model
+edits src into target); there is no `id` field. Lists must be nonempty
 integers (bool invalid), in vocabulary range and configured length limits.
 Raw rows cannot contain pad/placeholder tokens. Target and initial must start
 with BOS, end with EOS, and have no interior boundary tokens. Unknown keys,

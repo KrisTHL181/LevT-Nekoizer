@@ -64,7 +64,7 @@ def process_row(
     line_number: int,
 ) -> Dict[str, Any]:
     """Compute oracle and random insertion paths for one row."""
-    initial_list = row.get("initial", [config.bos_token_id, config.eos_token_id])
+    initial_list = row.get("initial", row["src"])
     target_list = row["target"]
 
     initial = torch.tensor(initial_list, dtype=torch.long)
@@ -115,7 +115,7 @@ def process_row(
 def show_stats(rows: List[Dict[str, Any]], config: LevTConfig) -> None:
     """Print statistics for the first 3 rows."""
     for i, row in enumerate(rows[:3]):
-        init_len = len(row.get("initial", [config.bos_token_id, config.eos_token_id]))
+        init_len = len(row.get("initial", row["src"]))
         print(f"--- Row {i + 1} ---")
         print(f"  src:            {len(row['src'])} tokens")
         print(f"  target:         {len(row['target'])} tokens")

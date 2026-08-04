@@ -36,8 +36,10 @@ PACKED_HEADER = {"__meta__": {"format": "levt-jsonl", "version": 1, "packed": Tr
 REGULAR_HEADER = {"__meta__": {"format": "levt-jsonl", "version": 1, "packed": False}}
 
 # A packed target holds two concatenated segments: [BOS] 7 [EOS] [BOS] 8 [EOS].
-PACKED_ROW = {"src": [4, 5], "target": [1, 7, 2, 1, 8, 2]}
-REGULAR_ROW = {"src": [4, 5], "target": [1, 7, 2]}
+# These rows are not about the missing-initial default, so they pass an
+# explicit [BOS, EOS] initial to keep src outside the BOS/EOS invariant.
+PACKED_ROW = {"src": [4, 5], "target": [1, 7, 2, 1, 8, 2], "initial": [1, 2]}
+REGULAR_ROW = {"src": [4, 5], "target": [1, 7, 2], "initial": [1, 2]}
 
 
 def _write(path, *lines):
@@ -49,7 +51,7 @@ def _write(path, *lines):
 
 def test_legacy_file_without_header_is_regular(tmp_path):
     path = tmp_path / "legacy.jsonl"
-    _write(path, REGULAR_ROW, {"src": [6], "target": [1, 8, 9, 2]})
+    _write(path, REGULAR_ROW, {"src": [6], "target": [1, 8, 9, 2], "initial": [1, 2]})
     dataset = JsonlDataset(path, tiny_config(), max_source_length=10, max_target_length=10)
     assert dataset.packed is False
     assert dataset.has_header is False
@@ -59,7 +61,8 @@ def test_legacy_file_without_header_is_regular(tmp_path):
 def test_packed_header_autodetects_and_skips_header(tmp_path):
     cfg = tiny_config()
     path = tmp_path / "packed.jsonl"
-    _write(path, PACKED_HEADER, PACKED_ROW, {"src": [6, 7], "target": [1, 9, 2, 1, 10, 2]})
+    _write(path, PACKED_HEADER, PACKED_ROW,
+           {"src": [6, 7], "target": [1, 9, 2, 1, 10, 2], "initial": [1, 2]})
     dataset = JsonlDataset(path, cfg, max_source_length=10, max_target_length=10)
     assert dataset.packed is True
     assert dataset.has_header is True

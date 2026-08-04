@@ -100,8 +100,8 @@ def test_packed_batch_trains_without_error():
         PolicyConfig(alpha=0.0, beta=0.5, random_delete_prob=0.3, label_smoothing=0.1),
     )
     rows = [
-        {"src": [4, 5, 2, 1, 6, 7], "target": [1, 7, 2, 1, 8, 2]},
-        {"src": [8, 9, 2, 1, 5, 6], "target": [1, 9, 2, 1, 6, 7, 2]},
+        {"src": [4, 5, 2, 1, 6, 7], "target": [1, 7, 2, 1, 8, 2], "initial": [1, 2]},
+        {"src": [8, 9, 2, 1, 5, 6], "target": [1, 9, 2, 1, 6, 7, 2], "initial": [1, 2]},
     ]
     collator = LevTCollator(
         cfg, max_source_length=10, max_target_length=10,
@@ -121,7 +121,7 @@ def test_unpacked_training_unchanged():
     model = LevTModel(cfg)
     trainer = DualPolicyTrainer(model, cfg, PolicyConfig(alpha=1.0, beta=1.0))
     rows = [
-        {"src": [4, 5], "target": [1, 7, 2]},
+        {"src": [4, 5], "target": [1, 7, 2], "initial": [1, 2]},
         {"src": [6], "target": [1, 8, 9, 2], "initial": [1, 10, 2]},
     ]
     batch = LevTCollator(cfg, max_source_length=10, max_target_length=10)(rows)

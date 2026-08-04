@@ -24,6 +24,10 @@ with a ``{"__meta__": {"format": "levt-jsonl", "version": 1, "packed": true}}``
 header line so training auto-detects the packed format.  ``n_segments`` is
 metadata for stats; the training pipeline ignores it.
 
+When an input row omits ``initial`` it defaults to that row's ``src``
+(edit-task semantics), so the packed ``initial`` is the concatenation of the
+source segments.
+
 The packing core is vectorised with numpy because a naive Python first-fit
 scan is O(examples x bins) — intractable for ~10^6 examples.
 
@@ -163,7 +167,7 @@ def _rebuild_and_write(
                 continue  # skip the dataset metadata header
             src: list[int] = record["src"]
             target: list[int] = record["target"]
-            initial: list[int] = record.get("initial", [bos, eos])
+            initial: list[int] = record.get("initial", src)
             if initial[0] != bos or initial[-1] != eos:
                 raise ValueError(
                     f"{path}:{line_no}: initial must start with BOS and end with EOS"

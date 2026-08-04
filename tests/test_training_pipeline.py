@@ -94,7 +94,7 @@ def test_accumulation_window_matches_merged_batch_gradients():
     merged = copy.deepcopy(base)
     policy = PolicyConfig(alpha=1.0, beta=1.0, label_smoothing=0.0)
     rows = [
-        {"src": [4], "target": [1, 7, 2]},
+        {"src": [4], "target": [1, 7, 2], "initial": [1, 2]},
         {"src": [5, 6, 7], "target": [1, 8, 9, 10, 2], "initial": [1, 11, 2]},
     ]
     collator = LevTCollator(cfg, max_source_length=10, max_target_length=10)
@@ -181,7 +181,7 @@ def test_prepared_batch_loss_sums_match_train_step_means():
     model = LevTModel(cfg)
     trainer = DualPolicyTrainer(model, cfg, PolicyConfig(alpha=1.0, beta=1.0))
     batch = LevTCollator(cfg, max_source_length=10, max_target_length=10)([
-        {"src": [4, 5], "target": [1, 7, 2]},
+        {"src": [4, 5], "target": [1, 7, 2], "initial": [1, 2]},
         {"src": [6], "target": [1, 8, 9, 2], "initial": [1, 10, 2]},
     ])
     torch.manual_seed(3)
@@ -270,16 +270,19 @@ def test_jsonl_defaults_initial_and_collates_seq_first(tmp_path):
     cfg = tiny_config()
     path = tmp_path / "train.jsonl"
     path.write_text(
-        json.dumps({"src": [4, 5], "target": [1, 7, 2]}) + "\n" +
+        json.dumps({"src": [1, 4, 5, 2], "target": [1, 7, 2]}) + "\n" +
         json.dumps({"src": [6], "target": [1, 8, 9, 2], "initial": [1, 10, 2]}) + "\n",
         encoding="utf-8",
     )
     dataset = JsonlDataset(path, cfg, max_source_length=10, max_target_length=10)
-    assert dataset[0]["initial"] == [cfg.bos_token_id, cfg.eos_token_id]
+    # Missing initial defaults to the full source sequence (edit-task semantics).
+    assert dataset[0]["initial"] == [1, 4, 5, 2]
     batch = LevTCollator(cfg, max_source_length=10, max_target_length=10)([dataset[0], dataset[1]])
-    assert batch["src_tokens"].shape == (2, 2)
-    assert batch["src_padding_mask"].shape == (2, 2)
-    assert batch["src_padding_mask"].tolist() == [[False, False], [False, True]]
+    assert batch["src_tokens"].shape == (4, 2)
+    assert batch["src_padding_mask"].shape == (2, 4)
+    assert batch["src_padding_mask"].tolist() == [
+        [False, False, False, False], [False, True, True, True]
+    ]
 
 
 def test_data_rejects_bool_and_bad_boundaries(tmp_path):
@@ -294,12 +297,27 @@ def test_data_rejects_bool_and_bad_boundaries(tmp_path):
         JsonlDataset(path, cfg, max_source_length=10, max_target_length=10)
 
 
+def test_decoder_default_y0_is_full_source():
+    cfg = tiny_config()
+    model = LevTModel(cfg)
+    decoder = GreedyDecoder(model, cfg)
+    src = torch.tensor([cfg.bos_token_id, 4, 5, cfg.eos_token_id])
+    _, _, trace = decoder.decode_with_trace(src)
+    assert trace[0][0] == "start"
+    assert trace[0][1].tolist() == src.tolist()
+
+    # An explicit [BOS, EOS] y0 reproduces the old generate-from-scratch start.
+    y0 = torch.tensor([cfg.bos_token_id, cfg.eos_token_id])
+    _, _, trace_explicit = decoder.decode_with_trace(src, y0)
+    assert trace_explicit[0][1].tolist() == y0.tolist()
+
+
 def test_batch_loss_backward():
     cfg = tiny_config()
     model = LevTModel(cfg)
     trainer = DualPolicyTrainer(model, cfg, PolicyConfig(alpha=1.0, beta=1.0))
     rows = [
-        {"src": [4, 5], "target": [1, 7, 2]},
+        {"src": [4, 5], "target": [1, 7, 2], "initial": [1, 2]},
         {"src": [6], "target": [1, 8, 9, 2], "initial": [1, 10, 2]},
     ]
     batch = LevTCollator(cfg, max_source_length=10, max_target_length=10)(rows)

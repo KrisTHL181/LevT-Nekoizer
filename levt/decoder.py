@@ -2,7 +2,9 @@
 Greedy decoder for the Levenshtein Transformer (Algorithm 2 from the paper).
 
 The decoding iterates:
-  1. Delete tokens   (skip if starting from empty)
+  1. Delete tokens   (default y0 is the full source sequence, so the deletion
+                      phase runs on iteration 1; an explicitly short initial
+                      sequence may still skip it)
   2. Insert placeholders
   3. Fill placeholders with predicted tokens
   4. Repeat until loop is detected or max iterations reached.
@@ -94,7 +96,9 @@ class GreedyDecoder:
 
         Args:
             src_tokens:       (src_len,) source tokens
-            y0:               (L0,) initial target tokens. Default: [BOS, EOS]
+            y0:               (L0,) initial target tokens. Default: the full
+                              source sequence (edit task). Pass [BOS, EOS]
+                              explicitly to generate from scratch.
             src_padding_mask: (src_len,) or None
             return_trace:     if True, also return a step-by-step trace with
                               per-phase average entropies
@@ -106,11 +110,7 @@ class GreedyDecoder:
                               ``(phase, token_tensor, entropy)`` tuples
         """
         if y0 is None:
-            y0 = torch.tensor(
-                [self.cfg.bos_token_id, self.cfg.eos_token_id],
-                dtype=src_tokens.dtype,
-                device=src_tokens.device,
-            )
+            y0 = src_tokens  # edit task: iteration 1 starts from the full source sequence
 
         src = src_tokens.unsqueeze(1)   # (S, 1)
         src_mask = src_padding_mask.unsqueeze(0) if src_padding_mask is not None else None
@@ -196,7 +196,8 @@ class GreedyDecoder:
 
         Args:
             src_tokens:       (src_len, batch) source tokens
-            y0_batch:         list of initial sequences, or None for [BOS,EOS] each
+            y0_batch:         list of initial sequences, or None to use the full
+                              source sequence for each example
             src_padding_mask: (batch, src_len) or None
 
         Returns:
