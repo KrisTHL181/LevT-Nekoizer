@@ -10,6 +10,7 @@ __pycache__/
 
 # Training data (generated, not source)
 *.jsonl
+*.tar.zst
 
 # Checkpoint files
 *.pt
@@ -21,7 +22,16 @@ target/
 # Training visualization artifacts
 progress.csv
 *.html
+loss_curves_light.png
 
 # IDE
 .idea/
 .vscode/
+
+# Claude Code
+.agents/
+.claude/
+.playwright-mcp/
+
+# Generated reports
+docs/REPORT_*.md
