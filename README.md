@@ -167,7 +167,7 @@ Data format (JSONL):
 {"src": [4, 5, 6], "target": [1, 9, 10, 2], "initial": [1, 2]}
 ```
 
-- `src` and `target` are required; `initial` defaults to the full source sequence `src`
+- `src` and `target` are required; `initial` defaults per `config.json`'s `initial_strategy` (`"src"` = the full source sequence, `"bos_eos"` = `[BOS, EOS]`)
 - Values are pre-tokenized integer ID lists — no tokenizer is bundled
 
 See `config.json` and `train_config.json` for all model and training knobs.

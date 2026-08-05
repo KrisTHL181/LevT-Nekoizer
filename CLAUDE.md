@@ -45,7 +45,8 @@ training passes `None` masks and is behaviorally identical.
 ## Configuration ownership
 
 `config.json` is loaded by `LevTConfig.from_json` and contains model
-architecture plus special IDs only. Unknown keys are rejected. Boolean switches
+architecture, special IDs, and the decoding initial-sequence strategy
+(`initial_strategy`: `"src"` or `"bos_eos"`). Unknown keys are rejected. Boolean switches
 require actual booleans, numeric settings must be finite, and `rope_base` must
 be positive. Special IDs must be distinct and in range. `embedding_dim` defaults
 to `d_model` for old Python callers. Legacy training constructor attributes
@@ -66,8 +67,10 @@ schema owning:
 ## Data
 
 JSONL rows use required `src` and `target`, plus optional `initial`. Missing
-`initial` defaults to the source sequence `src` (edit-task semantics: the model
-edits src into target); there is no `id` field. Lists must be nonempty
+`initial` defaults per `config.json`'s `initial_strategy`: `"src"` uses the full
+source sequence `src` (edit-task semantics: the model edits src into target),
+`"bos_eos"` uses the minimal `[BOS, EOS]` (generation from scratch); there is no
+`id` field. Lists must be nonempty
 integers (bool invalid), in vocabulary range and configured length limits.
 Raw rows cannot contain pad/placeholder tokens. Target and initial must start
 with BOS, end with EOS, and have no interior boundary tokens. Unknown keys,
@@ -188,7 +191,10 @@ flattening the segments into one batch call and re-concatenating. `random_deleti
 keeps every BOS/EOS token, not just the first/last.
 
 `GreedyDecoder` computes encoder memory once, then iterates delete, insert, and
-fill until convergence/loop detection or `max_iterations`. Each phase requests
+fill until convergence/loop detection or `max_iterations`. A missing explicit
+y0 defaults per `config.json`'s `initial_strategy` — the full source sequence
+(`"src"`, so the deletion phase runs on iteration 1) or `[BOS, EOS]`
+(`"bos_eos"`). Each phase requests
 only its required head, and token logits are computed only at PLH positions.
 PAD/BOS/EOS/PLH IDs are masked from fill predictions. Decoding temporarily
 switches to evaluation mode and restores the previous mode. BOS/EOS positions

@@ -2,9 +2,9 @@
 Greedy decoder for the Levenshtein Transformer (Algorithm 2 from the paper).
 
 The decoding iterates:
-  1. Delete tokens   (default y0 is the full source sequence, so the deletion
-                      phase runs on iteration 1; an explicitly short initial
-                      sequence may still skip it)
+  1. Delete tokens   (with the default ``"src"`` initial strategy y0 is the full
+                      source sequence, so the deletion phase runs on iteration 1;
+                      an explicitly short initial sequence may still skip it)
   2. Insert placeholders
   3. Fill placeholders with predicted tokens
   4. Repeat until loop is detected or max iterations reached.
@@ -96,9 +96,10 @@ class GreedyDecoder:
 
         Args:
             src_tokens:       (src_len,) source tokens
-            y0:               (L0,) initial target tokens. Default: the full
-                              source sequence (edit task). Pass [BOS, EOS]
-                              explicitly to generate from scratch.
+            y0:               (L0,) initial target tokens. Default: per
+                              ``config.initial_strategy`` — the full source
+                              sequence (``"src"``, edit task) or ``[BOS, EOS]``
+                              (``"bos_eos"``). Pass an explicit y0 to override.
             src_padding_mask: (src_len,) or None
             return_trace:     if True, also return a step-by-step trace with
                               per-phase average entropies
@@ -110,7 +111,13 @@ class GreedyDecoder:
                               ``(phase, token_tensor, entropy)`` tuples
         """
         if y0 is None:
-            y0 = src_tokens  # edit task: iteration 1 starts from the full source sequence
+            # Default y0 follows config.initial_strategy: the full source
+            # sequence (edit task) or a bare [BOS, EOS] (generation from scratch).
+            y0 = torch.tensor(
+                self.cfg.default_initial(src_tokens.tolist()),
+                dtype=src_tokens.dtype,
+                device=src_tokens.device,
+            )
 
         src = src_tokens.unsqueeze(1)   # (S, 1)
         src_mask = src_padding_mask.unsqueeze(0) if src_padding_mask is not None else None
@@ -196,8 +203,8 @@ class GreedyDecoder:
 
         Args:
             src_tokens:       (src_len, batch) source tokens
-            y0_batch:         list of initial sequences, or None to use the full
-                              source sequence for each example
+            y0_batch:         list of initial sequences, or None to use each
+                              example's config-driven default y0
             src_padding_mask: (batch, src_len) or None
 
         Returns:

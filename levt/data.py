@@ -87,8 +87,10 @@ def validate_record(
     The BOS-start / EOS-end invariant and the reserved-token checks still
     apply.
 
-    When ``initial`` is missing it defaults to the full source sequence
-    ``src`` (edit-task semantics: the model edits src into target).
+    When ``initial`` is missing it defaults according to
+    ``config.initial_strategy``: the full source sequence ``src`` (``"src"``,
+    edit-task semantics: the model edits src into target) or the minimal
+    ``[BOS, EOS]`` (``"bos_eos"``, generation from scratch).
     """
     if not isinstance(record, dict):
         raise ValueError(f"{source}: row must be a JSON object")
@@ -110,7 +112,7 @@ def validate_record(
         record["target"], "target", vocab_size=config.vocab_size,
         max_length=max_target_length, source=source,
     )
-    initial_value = record.get("initial", record["src"])
+    initial_value = record["initial"] if "initial" in record else config.default_initial(src)
     initial = _validate_token_list(
         initial_value, "initial", vocab_size=config.vocab_size,
         max_length=max_target_length, source=source,

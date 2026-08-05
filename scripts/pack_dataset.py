@@ -24,9 +24,11 @@ with a ``{"__meta__": {"format": "levt-jsonl", "version": 1, "packed": true}}``
 header line so training auto-detects the packed format.  ``n_segments`` is
 metadata for stats; the training pipeline ignores it.
 
-When an input row omits ``initial`` it defaults to that row's ``src``
-(edit-task semantics), so the packed ``initial`` is the concatenation of the
-source segments.
+When an input row omits ``initial`` it defaults according to the chosen
+initial strategy (``--config``'s ``initial_strategy``, or ``"src"`` when no
+config is given): with ``"src"`` the packed ``initial`` is the concatenation of
+the source segments; with ``"bos_eos"`` each omitted ``initial`` becomes the
+minimal ``[BOS, EOS]``.
 
 The packing core is vectorised with numpy because a naive Python first-fit
 scan is O(examples x bins) — intractable for ~10^6 examples.
@@ -50,6 +52,7 @@ import numpy as np
 # Make the repo root importable when run as ``python scripts/pack_dataset.py``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from levt.config import LevTConfig, default_initial_for
 from levt.dataset_meta import META_KEY, dataset_header
 
 
@@ -149,9 +152,14 @@ def _rebuild_and_write(
     bos: int,
     eos: int,
     tgt_cap: int,
+    initial_strategy: str = "src",
     limit: int = 0,
 ) -> tuple[list[int], int, int]:
-    """Pass 2: stream the file again, assemble per-bin rows, write output."""
+    """Pass 2: stream the file again, assemble per-bin rows, write output.
+
+    ``initial_strategy`` decides the ``initial`` for rows that omit it
+    (``"src"`` = the row's source, ``"bos_eos"`` = ``[bos, eos]``).
+    """
     # bins_data[b] = list of (src, target, initial) tuples
     bins_data: list[list[tuple[list[int], list[int], list[int]]]] = [
         [] for _ in range(n_bins)
@@ -167,7 +175,10 @@ def _rebuild_and_write(
                 continue  # skip the dataset metadata header
             src: list[int] = record["src"]
             target: list[int] = record["target"]
-            initial: list[int] = record.get("initial", src)
+            if "initial" in record:
+                initial: list[int] = record["initial"]
+            else:
+                initial = default_initial_for(initial_strategy, src, bos, eos)
             if initial[0] != bos or initial[-1] != eos:
                 raise ValueError(
                     f"{path}:{line_no}: initial must start with BOS and end with EOS"
@@ -248,14 +259,26 @@ def main() -> None:
     parser.add_argument("--algorithm", choices=["bfd", "ffd"], default="bfd")
     parser.add_argument("--bos-id", type=int, default=1)
     parser.add_argument("--eos-id", type=int, default=2)
+    parser.add_argument(
+        "--config", default=None,
+        help="LevT model config.json: overrides --bos-id/--eos-id and sets the "
+             "initial strategy (initial_strategy) for rows that omit 'initial'",
+    )
     parser.add_argument("--limit", type=int, default=0, help="only pack the first N rows (0 = all)")
     args = parser.parse_args()
+
+    # A model config, when given, is authoritative for the special IDs and the
+    # missing-initial strategy; without one we fall back to CLI IDs and "src".
+    model_config = LevTConfig.from_json(args.config) if args.config else None
+    bos_id = model_config.bos_token_id if model_config else args.bos_id
+    eos_id = model_config.eos_token_id if model_config else args.eos_id
+    initial_strategy = model_config.initial_strategy if model_config else "src"
 
     input_path = Path(args.input)
     output_path = Path(args.output)
     print(f"pass 1: scanning lengths of {input_path} ...", flush=True)
     src_len, tgt_len = _load_sizes(
-        input_path, args.src_capacity, args.tgt_capacity, args.bos_id, args.eos_id,
+        input_path, args.src_capacity, args.tgt_capacity, bos_id, eos_id,
         limit=args.limit,
     )
     print(f"  {len(src_len)} rows", flush=True)
@@ -268,8 +291,8 @@ def main() -> None:
 
     print(f"pass 2: rebuilding rows -> {output_path} ...", flush=True)
     n_segments, written, total_tokens = _rebuild_and_write(
-        input_path, output_path, bin_of_item, n_bins, args.bos_id, args.eos_id,
-        args.tgt_capacity, limit=args.limit,
+        input_path, output_path, bin_of_item, n_bins, bos_id, eos_id,
+        args.tgt_capacity, initial_strategy=initial_strategy, limit=args.limit,
     )
     assert written == n_bins, f"wrote {written} rows but packed {n_bins} bins"
 

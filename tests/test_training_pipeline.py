@@ -25,6 +25,7 @@ from levt import (
     load_checkpoint,
     save_checkpoint,
 )
+from levt.config import default_initial_for
 
 
 def tiny_config(**overrides):
@@ -285,6 +286,38 @@ def test_jsonl_defaults_initial_and_collates_seq_first(tmp_path):
     ]
 
 
+def test_jsonl_initial_strategy_bos_eos(tmp_path):
+    cfg = tiny_config(initial_strategy="bos_eos")
+    path = tmp_path / "train.jsonl"
+    path.write_text(
+        json.dumps({"src": [1, 4, 5, 2], "target": [1, 7, 2]}) + "\n" +
+        json.dumps({"src": [6], "target": [1, 8, 9, 2], "initial": [1, 10, 2]}) + "\n",
+        encoding="utf-8",
+    )
+    dataset = JsonlDataset(path, cfg, max_source_length=10, max_target_length=10)
+    # With the "bos_eos" strategy a missing initial becomes the minimal [BOS, EOS].
+    assert dataset[0]["initial"] == [1, 2]
+    assert dataset[1]["initial"] == [1, 10, 2]
+
+
+def test_initial_strategy_config_and_helper():
+    # The strict model JSON round-trip carries the strategy.
+    cfg = tiny_config(initial_strategy="bos_eos")
+    restored = LevTConfig.from_dict(cfg.to_dict(), strict_model=True)
+    assert restored.initial_strategy == "bos_eos"
+
+    # An explicit "src" matches the dataclass default.
+    assert tiny_config().initial_strategy == "src"
+
+    with pytest.raises(ValueError, match="initial_strategy"):
+        tiny_config(initial_strategy="prefix")
+
+    assert default_initial_for("src", [4, 5], bos=1, eos=2) == [4, 5]
+    assert default_initial_for("bos_eos", [4, 5], bos=1, eos=2) == [1, 2]
+    with pytest.raises(ValueError, match="initial strategy"):
+        default_initial_for("nope", [4], bos=1, eos=2)
+
+
 def test_data_rejects_bool_and_bad_boundaries(tmp_path):
     cfg = tiny_config()
     path = tmp_path / "bad.jsonl"
@@ -310,6 +343,16 @@ def test_decoder_default_y0_is_full_source():
     y0 = torch.tensor([cfg.bos_token_id, cfg.eos_token_id])
     _, _, trace_explicit = decoder.decode_with_trace(src, y0)
     assert trace_explicit[0][1].tolist() == y0.tolist()
+
+
+def test_decoder_initial_strategy_bos_eos_default_y0():
+    cfg = tiny_config(initial_strategy="bos_eos")
+    model = LevTModel(cfg)
+    decoder = GreedyDecoder(model, cfg)
+    src = torch.tensor([cfg.bos_token_id, 4, 5, cfg.eos_token_id])
+    _, _, trace = decoder.decode_with_trace(src)
+    assert trace[0][0] == "start"
+    assert trace[0][1].tolist() == [cfg.bos_token_id, cfg.eos_token_id]
 
 
 def test_batch_loss_backward():

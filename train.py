@@ -438,7 +438,13 @@ def main() -> None:
     checkpoint: Optional[Dict[str, Any]] = None
     if resume_path:
         checkpoint = load_checkpoint(resume_path, map_location="cpu")
-        if not args.bypass_config_check and checkpoint["model_config"] != model_cfg.to_dict():
+        saved_model_config = checkpoint["model_config"]
+        if isinstance(saved_model_config, dict):
+            # Keys missing from an older checkpoint (e.g. initial_strategy)
+            # fall back to the current config's values, mirroring the
+            # LevTConfig dataclass defaults.
+            saved_model_config = {**model_cfg.to_dict(), **saved_model_config}
+        if not args.bypass_config_check and saved_model_config != model_cfg.to_dict():
             raise ValueError("checkpoint model configuration does not match config.json")
         saved_train_config = checkpoint.get("train_config")
         current_train_config = train_cfg.to_dict()

@@ -22,5 +22,6 @@
   "elementwise_attn_output_gate": false,
   "max_placeholder": 255,
   "early_exit_del": null,
-  "early_exit_plh": null
+  "early_exit_plh": null,
+  "initial_strategy": "src"
 }

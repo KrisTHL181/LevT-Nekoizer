@@ -57,6 +57,14 @@ def load_policy_config(path: str) -> Dict[str, Any]:
     return config
 
 
+def _row_initial(row: Dict[str, Any], config: LevTConfig) -> List[int]:
+    """Return the row's ``initial``, defaulting per ``config.initial_strategy``."""
+    initial = row.get("initial")
+    if initial is None:
+        initial = config.default_initial(row["src"])
+    return initial
+
+
 def process_row(
     row: Dict[str, Any],
     config: LevTConfig,
@@ -64,7 +72,7 @@ def process_row(
     line_number: int,
 ) -> Dict[str, Any]:
     """Compute oracle and random insertion paths for one row."""
-    initial_list = row.get("initial", row["src"])
+    initial_list = _row_initial(row, config)
     target_list = row["target"]
 
     initial = torch.tensor(initial_list, dtype=torch.long)
@@ -115,7 +123,7 @@ def process_row(
 def show_stats(rows: List[Dict[str, Any]], config: LevTConfig) -> None:
     """Print statistics for the first 3 rows."""
     for i, row in enumerate(rows[:3]):
-        init_len = len(row.get("initial", row["src"]))
+        init_len = len(_row_initial(row, config))
         print(f"--- Row {i + 1} ---")
         print(f"  src:            {len(row['src'])} tokens")
         print(f"  target:         {len(row['target'])} tokens")

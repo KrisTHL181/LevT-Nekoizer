@@ -6,10 +6,29 @@ import json
 import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 
 
 T = TypeVar("T")
+
+
+def default_initial_for(
+    strategy: str,
+    src: Sequence[int],
+    bos: int,
+    eos: int,
+) -> List[int]:
+    """Default initial token sequence for a data row that omits ``initial``.
+
+    ``"src"`` uses the full source sequence (edit-task semantics: the model
+    edits src into target). ``"bos_eos"`` uses the minimal ``[BOS, EOS]``
+    (generation from scratch).
+    """
+    if strategy == "src":
+        return list(src)
+    if strategy == "bos_eos":
+        return [bos, eos]
+    raise ValueError(f"unknown initial strategy: {strategy!r}")
 
 
 def _strict_dataclass(cls: Type[T], data: Dict[str, Any], source: str) -> T:
@@ -90,6 +109,10 @@ class LevTConfig:
     early_exit_plh: Optional[int] = None
     max_iterations: int = 10
     placeholder_penalty: float = 0.0
+    # Which initial sequence a data row falls back to when it omits ``initial``.
+    # ``"src"`` = the full source sequence (edit task); ``"bos_eos"`` = [BOS, EOS]
+    # (generation from scratch).
+    initial_strategy: str = "src"
 
     # Constructor-only compatibility fields. Strict model JSON rejects these.
     alpha: Optional[float] = None
@@ -109,7 +132,7 @@ class LevTConfig:
         "max_source_positions", "max_target_positions", "qk_norm",
         "headwise_attn_output_gate", "elementwise_attn_output_gate",
         "max_placeholder", "early_exit_del", "early_exit_plh",
-        "max_iterations", "placeholder_penalty",
+        "max_iterations", "placeholder_penalty", "initial_strategy",
     }
 
     def __post_init__(self) -> None:
@@ -168,6 +191,8 @@ class LevTConfig:
             or not math.isfinite(self.placeholder_penalty)
         ):
             raise ValueError("placeholder_penalty must be finite numeric")
+        if self.initial_strategy not in {"src", "bos_eos"}:
+            raise ValueError("initial_strategy must be one of: src, bos_eos")
         special = {
             "pad_token_id": self.pad_token_id,
             "bos_token_id": self.bos_token_id,
@@ -185,6 +210,16 @@ class LevTConfig:
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < self.n_decoder_layers):
                 raise ValueError(f"{name} must be a valid decoder layer index")
+
+    def default_initial(self, src: Sequence[int]) -> List[int]:
+        """Default initial token sequence for a row that omits ``initial``.
+
+        Follows :attr:`initial_strategy`: ``"src"`` returns the full source
+        sequence, ``"bos_eos"`` returns ``[BOS, EOS]``.
+        """
+        return default_initial_for(
+            self.initial_strategy, src, self.bos_token_id, self.eos_token_id,
+        )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, strict_model: bool = False) -> "LevTConfig":
