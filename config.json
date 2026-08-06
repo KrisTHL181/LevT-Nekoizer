@@ -23,5 +23,5 @@
   "max_placeholder": 255,
   "early_exit_del": null,
   "early_exit_plh": null,
-  "initial_strategy": "src"
+  "initial_strategy": "bos_eos"
 }
